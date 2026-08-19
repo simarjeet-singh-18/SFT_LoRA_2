@@ -444,6 +444,24 @@ def main():
                               "otherwise. Requires SNIP saliency scores to be available, i.e. --pruned-block "
                               "must be left at its default (-1) so the automatic SNIP search actually runs -- "
                               "see the validation check below for the manual --pruned-block case.")
+    parser.add_argument("--num-lora-blocks", type=int, default=0,
+                         help="Static SNIP-guided LoRA placement: inject LoRA/DoRA into ONLY the N most "
+                              "task-sensitive surviving blocks (highest SNIP saliency, excluding whichever "
+                              "block(s) were replaced by a filter block), instead of adapting every surviving "
+                              "block. This traces the accuracy-vs-adapter-params curve -- e.g. sweep N in "
+                              "{2,3,4,6,8} to see whether concentrating adapters on a few important blocks "
+                              "matches adapting all of them at a fraction of the adapter params. 0 (default) = "
+                              "adapt ALL surviving blocks (unchanged prior behavior). Blocks NOT selected keep "
+                              "their frozen pre-trained weights with no adapter. Only meaningful when "
+                              "--lora-rank > 0. Like --num-ortho-blocks, it ranks by SNIP saliency, so it "
+                              "requires the automatic SNIP search: leave --pruned-block at its default (-1). "
+                              "Mutually exclusive with --lora-blocks (which names blocks explicitly).")
+    parser.add_argument("--lora-blocks", type=str, default=None,
+                         help="Static LoRA placement by EXPLICIT block indices, e.g. --lora-blocks 6,8,9,11. "
+                              "Injects LoRA/DoRA into only these blocks (any that were filter-substituted are "
+                              "silently ignored). Unlike --num-lora-blocks this needs no SNIP ranking, so it "
+                              "works with a manual --pruned-block too. None (default) = adapt all surviving "
+                              "blocks. Mutually exclusive with --num-lora-blocks.")
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
     parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -471,7 +489,7 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=0,
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0,
-                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
+                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1%% of peak).")
     parser.add_argument("--grad-clip", type=float, default=0.0,
                          help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
                               "against LR spikes destabilizing training, especially in --full-finetune mode.")
@@ -528,6 +546,55 @@ def main():
                       "block(s) to replace are found automatically. --pruned-block was set explicitly "
                       "(skipping the SNIP search), so there are no saliency scores to rank the remaining "
                       "LoRA blocks by. Leave --pruned-block at its default (-1) to use --num-ortho-blocks.")
+
+    # --- Static SNIP-guided / explicit LoRA placement validation ---
+    if args.num_lora_blocks < 0:
+        parser.error("--num-lora-blocks must be >= 0 (0 = adapt all surviving blocks).")
+    if args.num_lora_blocks > 0 and args.lora_blocks is not None:
+        parser.error("--num-lora-blocks (top-k by SNIP) and --lora-blocks (explicit list) are mutually "
+                      "exclusive -- pass only one.")
+    if args.num_lora_blocks > 0 and args.full_finetune:
+        parser.error("--num-lora-blocks has no effect with --full-finetune (there's no LoRA to place). "
+                      "Drop one of them.")
+    if args.lora_blocks is not None and args.full_finetune:
+        parser.error("--lora-blocks has no effect with --full-finetune (there's no LoRA to place). "
+                      "Drop one of them.")
+    if args.num_lora_blocks > 0 and args.lora_rank <= 0:
+        parser.error("--num-lora-blocks requires --lora-rank > 0 (there are no adapters to place otherwise).")
+    if args.lora_blocks is not None and args.lora_rank <= 0:
+        parser.error("--lora-blocks requires --lora-rank > 0 (there are no adapters to place otherwise).")
+    if args.num_lora_blocks > 0 and args.pruned_block != -1:
+        parser.error("--num-lora-blocks ranks blocks by SNIP saliency, which is only computed when the "
+                      "block(s) to replace are found automatically. --pruned-block was set explicitly "
+                      "(skipping the SNIP search). Either leave --pruned-block at -1, or name the LoRA "
+                      "blocks explicitly with --lora-blocks instead.")
+    # Parse the explicit --lora-blocks list once, here, so a bad value fails fast.
+    lora_blocks_explicit = None
+    if args.lora_blocks is not None:
+        try:
+            lora_blocks_explicit = sorted({int(tok) for tok in args.lora_blocks.split(",") if tok.strip() != ""})
+        except ValueError:
+            parser.error(f"--lora-blocks must be a comma-separated list of integers, got: {args.lora_blocks!r}")
+        if len(lora_blocks_explicit) == 0:
+            parser.error("--lora-blocks was given but parsed to an empty set; pass at least one block index.")
+        if any(b < 0 for b in lora_blocks_explicit):
+            parser.error("--lora-blocks indices must be non-negative.")
+    args.lora_blocks_explicit = lora_blocks_explicit
+
+    # Interaction: restricting LoRA placement AND selective orthogonality together.
+    # Both rank by SNIP saliency, so if num_ortho_blocks <= num_lora_blocks the ortho
+    # set is a subset of the adapted set (correct). Only warn if the ortho budget
+    # could exceed the adapted set, which would request ortho on blocks with no LoRA
+    # (harmless -- no layer to attach to -- but a sign the flags disagree).
+    if args.num_ortho_blocks > 0:
+        if args.num_lora_blocks > 0 and args.num_ortho_blocks > args.num_lora_blocks:
+            print(f"[SFP] Warning: --num-ortho-blocks ({args.num_ortho_blocks}) > --num-lora-blocks "
+                  f"({args.num_lora_blocks}). Only the {args.num_lora_blocks} adapted blocks can carry the "
+                  f"orthogonality penalty; the extra ortho slots have no adapter to apply to.")
+        if lora_blocks_explicit is not None and args.num_ortho_blocks > len(lora_blocks_explicit):
+            print(f"[SFP] Warning: --num-ortho-blocks ({args.num_ortho_blocks}) exceeds the number of "
+                  f"explicitly-placed LoRA blocks ({len(lora_blocks_explicit)}). Ortho can only apply to "
+                  f"blocks that actually have an adapter.")
 
     # --mode is a thin, explicit selector over the three configurations the rest of
     # this script already supports individually (--full-finetune, plain SNIP+filter-
@@ -610,6 +677,10 @@ def main():
     snip_saliencies = None
     snip_plot_path = None
     filter_blocks = []
+    # Resolved LoRA placement (Step 1). Stays None when adapters go on every
+    # surviving block (default) or when there's no LoRA; set to the concrete list
+    # of adapted block indices when --lora-blocks / --num-lora-blocks restricts it.
+    lora_included_blocks = None
 
     if args.full_finetune:
         print("[SFP] --full-finetune set: skipping SNIP search, filter block substitution, "
@@ -641,6 +712,24 @@ def main():
                   f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
                   f"All other LoRA blocks use plain (unregularized) LoRA.")
 
+        # Static LoRA placement (Step 1): restrict adapters to a subset of blocks.
+        # --lora-blocks names them explicitly; --num-lora-blocks picks the top-k by
+        # SNIP saliency (excluding the filter-substituted block, same ranking used
+        # for orthogonality). None => adapt all surviving blocks (prior behavior).
+        if args.lora_rank > 0:
+            if args.lora_blocks_explicit is not None:
+                lora_included_blocks = args.lora_blocks_explicit
+                print(f"[SFP] Static LoRA placement: adapting only explicitly-named block(s) "
+                      f"{lora_included_blocks} (filter-substituted blocks are ignored).")
+            elif args.num_lora_blocks > 0:
+                lora_included_blocks = select_top_sensitive_blocks(
+                    snip_saliencies, [pruned_block_idx], args.num_lora_blocks
+                )
+                print(f"[SFP] Static SNIP-guided LoRA placement: adapting only the top "
+                      f"{args.num_lora_blocks} most task-sensitive block(s) (highest SNIP saliency): "
+                      f"{lora_included_blocks}. All other blocks stay frozen with no adapter.")
+        included_block_indices = lora_included_blocks
+
         filter_block = apply_single_filter_and_lora(
             model,
             pruned_block_idx=pruned_block_idx,
@@ -657,6 +746,7 @@ def main():
             init_method=args.init_method,
             loftq_bits=args.loftq_bits,
             loftq_iters=args.loftq_iters,
+            included_block_indices=included_block_indices,
         )
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
         filter_blocks = [filter_block]
@@ -701,14 +791,33 @@ def main():
                   f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
                   f"All other LoRA blocks use plain (unregularized) LoRA.")
 
+        # Static LoRA placement (Step 1), multi-filter case: same knobs as the
+        # single-block path. --lora-blocks names blocks explicitly; --num-lora-blocks
+        # takes the top-k by SNIP saliency excluding ALL filter-substituted blocks.
+        if args.lora_rank > 0:
+            if args.lora_blocks_explicit is not None:
+                lora_included_blocks = args.lora_blocks_explicit
+                print(f"[SFP] Static LoRA placement: adapting only explicitly-named block(s) "
+                      f"{lora_included_blocks} (filter-substituted blocks are ignored).")
+            elif args.num_lora_blocks > 0:
+                lora_included_blocks = select_top_sensitive_blocks(
+                    snip_saliencies, pruned_block_indices, args.num_lora_blocks
+                )
+                print(f"[SFP] Static SNIP-guided LoRA placement: adapting only the top "
+                      f"{args.num_lora_blocks} most task-sensitive block(s) (highest SNIP saliency): "
+                      f"{lora_included_blocks}. All other blocks stay frozen with no adapter.")
+        included_block_indices = lora_included_blocks
+
         lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout,
                                    ortho_block_indices=ortho_block_indices, adapter_type=args.adapter_type,
                                    init_method=args.init_method, loftq_bits=args.loftq_bits,
-                                   loftq_iters=args.loftq_iters)
+                                   loftq_iters=args.loftq_iters, included_block_indices=included_block_indices)
         ln_params = freeze_non_trainable(model, pruned_block_indices)
+        _placement_desc = (f"in blocks {included_block_indices}" if included_block_indices is not None
+                           else f"across all blocks except {pruned_block_indices}")
         print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
               f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
-              f"init={args.init_method}) across all blocks except {pruned_block_indices}.")
+              f"init={args.init_method}) {_placement_desc}.")
         print(f"[SFP-MultiFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
 
     # 6. Optimization Loop
@@ -910,6 +1019,8 @@ def main():
         "filter_residual_dropout": args.filter_residual_dropout if args.filter_residual_hidden_dim > 0 else None,
         "lora_rank": args.lora_rank if not args.full_finetune else None,
         "num_ortho_blocks": args.num_ortho_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
+        "num_lora_blocks": args.num_lora_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
+        "lora_included_blocks": lora_included_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
         "adapter_type": args.adapter_type if (not args.full_finetune and args.lora_rank > 0) else None,
         "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
         "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0

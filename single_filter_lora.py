@@ -88,8 +88,21 @@ class LoRALinear(nn.Module):
         self.apply_ortho = apply_ortho
 
         if rank > 0:
-            self.lora_A = nn.Parameter(torch.zeros(rank, base_layer.in_features))
-            self.lora_B = nn.Parameter(torch.zeros(base_layer.out_features, rank))
+            # Create the LoRA params on the SAME device/dtype as the frozen base
+            # layer's weight. torch.zeros() defaults to CPU, but inject_lora() runs
+            # AFTER model.to(device) in train_sfp_lora.main(), so the base layer is
+            # already on CUDA. For plain LoRA the CPU/GPU split is harmless (nothing
+            # mixes the two until a later .to(device)), but the DoRA branch below
+            # computes V0 = base_layer.weight + scaling*(lora_B @ lora_A) at
+            # construction time -- and the LoftQ init likewise touches
+            # base_layer.weight during __init__ -- so a device mismatch there raises
+            # "Expected all tensors to be on the same device". Pinning device/dtype
+            # here fixes both without changing any initialization VALUES
+            # (reset_parameters() still overwrites lora_A/lora_B right after).
+            _device = base_layer.weight.device
+            _dtype = base_layer.weight.dtype
+            self.lora_A = nn.Parameter(torch.zeros(rank, base_layer.in_features, device=_device, dtype=_dtype))
+            self.lora_B = nn.Parameter(torch.zeros(base_layer.out_features, rank, device=_device, dtype=_dtype))
             self.reset_parameters()
 
             if init_method == "loftq":
