@@ -5,3 +5,4 @@ data/
 __pycache__/
 addition_trials/
 random_selection_experiments/
+legacy_code/

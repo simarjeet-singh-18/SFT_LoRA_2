@@ -88,21 +88,22 @@ class LoRALinear(nn.Module):
         self.apply_ortho = apply_ortho
 
         if rank > 0:
-            # Create the LoRA params on the SAME device/dtype as the frozen base
-            # layer's weight. torch.zeros() defaults to CPU, but inject_lora() runs
-            # AFTER model.to(device) in train_sfp_lora.main(), so the base layer is
-            # already on CUDA. For plain LoRA the CPU/GPU split is harmless (nothing
-            # mixes the two until a later .to(device)), but the DoRA branch below
-            # computes V0 = base_layer.weight + scaling*(lora_B @ lora_A) at
-            # construction time -- and the LoftQ init likewise touches
-            # base_layer.weight during __init__ -- so a device mismatch there raises
-            # "Expected all tensors to be on the same device". Pinning device/dtype
-            # here fixes both without changing any initialization VALUES
-            # (reset_parameters() still overwrites lora_A/lora_B right after).
-            _device = base_layer.weight.device
-            _dtype = base_layer.weight.dtype
-            self.lora_A = nn.Parameter(torch.zeros(rank, base_layer.in_features, device=_device, dtype=_dtype))
-            self.lora_B = nn.Parameter(torch.zeros(base_layer.out_features, rank, device=_device, dtype=_dtype))
+            # IMPORTANT: match base_layer.weight's device/dtype here, not just
+            # leave these as default CPU float32 tensors. Plain LoRA gets away
+            # with skipping this (nothing touches lora_A/lora_B until the whole
+            # model's later .to(device) call), but DoRA's magnitude init below
+            # computes with base_layer.weight IMMEDIATELY, inside __init__ --
+            # if the model was already moved to GPU before inject_lora() runs
+            # (the normal case: train_sfp_lora.py does model.to(device) early,
+            # then injects LoRA/DoRA afterward), base_layer.weight is already on
+            # cuda while a device-less torch.zeros(...) defaults to cpu, causing
+            # "Expected all tensors to be on the same device" at this exact line.
+            base_device = base_layer.weight.device
+            base_dtype = base_layer.weight.dtype
+            self.lora_A = nn.Parameter(torch.zeros(rank, base_layer.in_features,
+                                                     device=base_device, dtype=base_dtype))
+            self.lora_B = nn.Parameter(torch.zeros(base_layer.out_features, rank,
+                                                     device=base_device, dtype=base_dtype))
             self.reset_parameters()
 
             if init_method == "loftq":
@@ -552,7 +553,7 @@ def count_parameter_breakdown(model: nn.Module, pruned_block_idx=None) -> dict:
 
         if any(f"blocks.{idx}" in name for idx in pruned_indices):
             breakdown["filter_block"] += n
-        elif "lora_" in name:
+        elif "lora_" in name or name.endswith(".magnitude"):
             breakdown["lora"] += n
         elif "norm" in name.lower():
             breakdown["layernorm"] += n
@@ -592,6 +593,79 @@ def substitute_filter_block(model: nn.Module, block_idx: int, num_layers: int = 
                                       residual_alpha=residual_alpha, residual_dropout=residual_dropout)
     model.blocks[block_idx] = filter_block
     return filter_block
+
+
+def compute_block_target_param_count(block: nn.Module, target_keywords: list = ["qkv", "proj", "fc1", "fc2"]) -> int:
+    """
+    Sums weight+bias parameter counts over every nn.Linear submodule of `block`
+    whose name matches target_keywords -- i.e. the same set of layers inject_lora
+    would wrap with adapters. Used to answer "how many parameters would full
+    fine-tuning have trained in this block's target layers", as the reference
+    point for --compensate-params: how many parameters were LOST by replacing this
+    block with a (typically much smaller) filter block, that we then try to
+    compensate for by adding extra LoRA/DoRA rank to the OTHER blocks.
+
+    Call this BEFORE substitute_filter_block replaces the block -- afterward, the
+    original Linear layers no longer exist to count.
+    """
+    total = 0
+    for name, module in block.named_modules():
+        if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+            total += module.weight.numel()
+            if module.bias is not None:
+                total += module.bias.numel()
+    return total
+
+
+def compute_compensated_rank(
+    model: nn.Module,
+    excluded_block_indices,
+    base_rank: int,
+    param_deficit: int,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+) -> dict:
+    """
+    Solves for a LoRA/DoRA rank >= base_rank such that the EXTRA adapter
+    parameters added (relative to base_rank) across every LoRA-eligible layer in
+    every non-excluded block approximately covers param_deficit -- the parameter
+    "budget" lost by replacing a block with a smaller filter block (see
+    compute_block_target_param_count).
+
+    Each target Linear layer of shape (out_features, in_features) costs
+    (in_features + out_features) extra parameters per +1 rank (that's exactly
+    lora_A's and lora_B's per-rank-unit size: lora_A row is in_features long,
+    lora_B column is out_features long). Summing that over every target layer in
+    every non-excluded block gives a total "cost per rank unit"; dividing the
+    deficit by that gives how many EXTRA ranks are needed.
+
+    NOTE: this only accounts for the rank-DEPENDENT cost. DoRA's per-layer
+    magnitude vector (out_features per layer) is a separate, rank-INDEPENDENT
+    fixed cost that doesn't change with rank, so it's intentionally excluded from
+    this "cost per rank unit" calculation (including it would bias the solved
+    rank without actually helping compensate proportionally to the deficit).
+
+    Returns {"compensated_rank": int, "cost_per_rank_unit": int, "extra_rank": int}.
+    If param_deficit <= 0 (filter block wasn't actually smaller, or --compensate-params
+    is being used somewhere it doesn't make sense), returns base_rank unchanged.
+    """
+    excluded = _normalize_indices(excluded_block_indices)
+    cost_per_rank_unit = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        for name, module in block.named_modules():
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                cost_per_rank_unit += module.in_features + module.out_features
+
+    if param_deficit <= 0 or cost_per_rank_unit <= 0:
+        return {"compensated_rank": base_rank, "cost_per_rank_unit": cost_per_rank_unit, "extra_rank": 0}
+
+    extra_rank = math.ceil(param_deficit / cost_per_rank_unit)
+    return {
+        "compensated_rank": base_rank + extra_rank,
+        "cost_per_rank_unit": cost_per_rank_unit,
+        "extra_rank": extra_rank,
+    }
 
 
 def select_top_sensitive_blocks(saliencies: dict, excluded_indices, num_blocks: int) -> list:

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 
 # Must be set BEFORE torch is imported / any CUDA context is created. Without this,
@@ -27,8 +28,11 @@ from single_filter_lora import (
     freeze_non_trainable,
     compute_lora_orthogonality_loss,
     select_top_sensitive_blocks,
+    compute_block_target_param_count,
+    compute_compensated_rank,
 )
 from snip_selection import select_block_with_snip, select_blocks_with_snip
+from ablation_selection import select_block_with_ablation
 from run_naming import build_run_folder_name
 from plotting import (
     ensure_dir,
@@ -161,7 +165,9 @@ def denormalize(tensor: torch.Tensor, mean: list, std: list) -> torch.Tensor:
 
 
 def build_misclassified_folder_name(full_finetune: bool, lora_rank: int, adapter_type: str,
-                                     init_method: str, ortho_enabled: bool, seed: int) -> str:
+                                     init_method: str, ortho_enabled: bool, seed: int,
+                                     block_selection_method: str = "snip",
+                                     compensate_params: bool = False) -> str:
     """
     Builds a clean, config-identifiable folder name for a run's misclassified-image
     dump, per this project's requested naming scheme:
@@ -178,16 +184,27 @@ def build_misclassified_folder_name(full_finetune: bool, lora_rank: int, adapter
       different, unambiguous folder name (never silently overwrites a
       differently-configured run's misclassified images).
 
+      block_selection_method="ablation" appends "_ablation" (e.g.
+      folder_sft_seed_0_ablation), so the SNIP-selected and ablation-selected
+      variants of an otherwise-identical config land in different folders instead
+      of overwriting each other. "snip" (default) adds no suffix, so all prior
+      folder names are unchanged.
+
+      compensate_params=True appends "_paramcomp" (e.g.
+      folder_sft_dora_seed_0_paramcomp), for the same reason -- so the
+      parameter-compensated DoRA config doesn't collide with the plain one.
+
     This is deliberately independent of run_naming.build_run_folder_name (which
     encodes EVERY CLI flag passed and gets long/unwieldy) -- this one only encodes
-    the handful of dimensions that actually change WHICH of the four
-    paper-comparison configurations a run represents, so it stays short and
-    consistently structured across runs.
+    the handful of dimensions that actually change WHICH of the paper-comparison
+    configurations a run represents, so it stays short and consistently
+    structured across runs.
     """
     if full_finetune:
         return f"folder_fft_seed_{seed}"
     if lora_rank <= 0:
-        return f"folder_sft_seed_{seed}"
+        base = f"folder_sft_seed_{seed}"
+        return base + ("_ablation" if block_selection_method == "ablation" else "")
 
     parts = ["folder", "sft", adapter_type]  # adapter_type: "lora" or "dora"
     if init_method == "loftq":
@@ -195,7 +212,12 @@ def build_misclassified_folder_name(full_finetune: bool, lora_rank: int, adapter
     if ortho_enabled:
         parts.append("orthogonal")
     parts += ["seed", str(seed)]
-    return "_".join(parts)
+    name = "_".join(parts)
+    if block_selection_method == "ablation":
+        name += "_ablation"
+    if compensate_params:
+        name += "_paramcomp"
+    return name
 
 
 def evaluate_and_save_misclassified(
@@ -444,25 +466,53 @@ def main():
                               "otherwise. Requires SNIP saliency scores to be available, i.e. --pruned-block "
                               "must be left at its default (-1) so the automatic SNIP search actually runs -- "
                               "see the validation check below for the manual --pruned-block case.")
-    parser.add_argument("--num-lora-blocks", type=int, default=0,
-                         help="Static SNIP-guided LoRA placement: inject LoRA/DoRA into ONLY the N most "
-                              "task-sensitive surviving blocks (highest SNIP saliency, excluding whichever "
-                              "block(s) were replaced by a filter block), instead of adapting every surviving "
-                              "block. This traces the accuracy-vs-adapter-params curve -- e.g. sweep N in "
-                              "{2,3,4,6,8} to see whether concentrating adapters on a few important blocks "
-                              "matches adapting all of them at a fraction of the adapter params. 0 (default) = "
-                              "adapt ALL surviving blocks (unchanged prior behavior). Blocks NOT selected keep "
-                              "their frozen pre-trained weights with no adapter. Only meaningful when "
-                              "--lora-rank > 0. Like --num-ortho-blocks, it ranks by SNIP saliency, so it "
-                              "requires the automatic SNIP search: leave --pruned-block at its default (-1). "
-                              "Mutually exclusive with --lora-blocks (which names blocks explicitly).")
-    parser.add_argument("--lora-blocks", type=str, default=None,
-                         help="Static LoRA placement by EXPLICIT block indices, e.g. --lora-blocks 6,8,9,11. "
-                              "Injects LoRA/DoRA into only these blocks (any that were filter-substituted are "
-                              "silently ignored). Unlike --num-lora-blocks this needs no SNIP ranking, so it "
-                              "works with a manual --pruned-block too. None (default) = adapt all surviving "
-                              "blocks. Mutually exclusive with --num-lora-blocks.")
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
+
+    parser.add_argument("--block-selection-method", type=str, default="snip", choices=["snip", "ablation"],
+                         help="How to choose which block(s) get replaced by the filter block. "
+                              "'snip' (default, unchanged): gradient-based SNIP saliency proxy, computed "
+                              "once via a single forward+backward pass -- cheap, but only an approximation "
+                              "of true importance. "
+                              "'ablation': DIRECTLY measures each block's actual contribution by "
+                              "temporarily bypassing it (identity skip) and re-running --ablation-num-batches "
+                              "calibration batches, for every block in turn (see ablation_selection.py). "
+                              "More faithful (it measures real effect, not a proxy) but more expensive "
+                              "(num_blocks + 1 forward passes over --ablation-num-batches batches, vs SNIP's "
+                              "single forward+backward). When 'ablation' is used AND the block is being "
+                              "auto-selected (--pruned-block left at -1), this ALSO runs the SNIP search "
+                              "purely for comparison and writes both results -- which block SNIP would have "
+                              "picked vs which block ablation picks, and whether they agree -- to "
+                              "<output_dir>/block_selection_comparison.json. Only supported for the "
+                              "single-block case (--num-filter-blocks 1, the default); combining with "
+                              "--num-filter-blocks > 1 is not currently implemented and will error out.")
+    parser.add_argument("--ablation-num-batches", type=int, default=6,
+                         help="Number of calibration batches used by --block-selection-method ablation, "
+                              "both for the baseline (no block removed) measurement and for each "
+                              "per-block ablation measurement. Default 6 (a small, cheap calibration "
+                              "sample -- the original version of this method). Pass 0 (or any value <= 0) "
+                              "to instead use the ENTIRE training set for every measurement -- i.e. "
+                              "num_blocks+1 full passes over all your downstream data, no batch cap. Same "
+                              "identity-bypass methodology either way; this only controls how much data "
+                              "each measurement averages over (more data = less noisy baseline/per-block "
+                              "estimates, at proportionally higher compute cost). Only used when "
+                              "--block-selection-method ablation.")
+    parser.add_argument("--compensate-params", action="store_true",
+                         help="Increases --lora-rank (for whichever adapter --adapter-type selects, LoRA "
+                              "or DoRA) on the remaining (non-filter-block) transformer blocks to "
+                              "approximately compensate for the trainable-parameter budget lost by "
+                              "replacing a block with the (typically much smaller) filter block -- i.e. "
+                              "'the parameters we removed by substituting a block get added back as extra "
+                              "adapter capacity on the other blocks', rather than just shrinking the "
+                              "model's total effective capacity. The compensated rank is solved so the "
+                              "EXTRA adapter parameters (relative to the --lora-rank you passed) "
+                              "approximately cover (original block's target-layer param count) minus "
+                              "(filter block's own param count); see compute_compensated_rank in "
+                              "single_filter_lora.py for the exact arithmetic. The resolved rank is logged "
+                              "and recorded in metrics_summary.json as lora_rank_effective (vs "
+                              "lora_rank_base = what you passed via --lora-rank). Requires --lora-rank > 0 "
+                              "and is incompatible with --full-finetune (there's no filter-block "
+                              "replacement, hence no deficit to compensate for, in that mode).")
+
     parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--label-smoothing", type=float, default=0.1,
@@ -489,7 +539,7 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=0,
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0,
-                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1%% of peak).")
+                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
     parser.add_argument("--grad-clip", type=float, default=0.0,
                          help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
                               "against LR spikes destabilizing training, especially in --full-finetune mode.")
@@ -546,55 +596,24 @@ def main():
                       "block(s) to replace are found automatically. --pruned-block was set explicitly "
                       "(skipping the SNIP search), so there are no saliency scores to rank the remaining "
                       "LoRA blocks by. Leave --pruned-block at its default (-1) to use --num-ortho-blocks.")
-
-    # --- Static SNIP-guided / explicit LoRA placement validation ---
-    if args.num_lora_blocks < 0:
-        parser.error("--num-lora-blocks must be >= 0 (0 = adapt all surviving blocks).")
-    if args.num_lora_blocks > 0 and args.lora_blocks is not None:
-        parser.error("--num-lora-blocks (top-k by SNIP) and --lora-blocks (explicit list) are mutually "
-                      "exclusive -- pass only one.")
-    if args.num_lora_blocks > 0 and args.full_finetune:
-        parser.error("--num-lora-blocks has no effect with --full-finetune (there's no LoRA to place). "
-                      "Drop one of them.")
-    if args.lora_blocks is not None and args.full_finetune:
-        parser.error("--lora-blocks has no effect with --full-finetune (there's no LoRA to place). "
-                      "Drop one of them.")
-    if args.num_lora_blocks > 0 and args.lora_rank <= 0:
-        parser.error("--num-lora-blocks requires --lora-rank > 0 (there are no adapters to place otherwise).")
-    if args.lora_blocks is not None and args.lora_rank <= 0:
-        parser.error("--lora-blocks requires --lora-rank > 0 (there are no adapters to place otherwise).")
-    if args.num_lora_blocks > 0 and args.pruned_block != -1:
-        parser.error("--num-lora-blocks ranks blocks by SNIP saliency, which is only computed when the "
-                      "block(s) to replace are found automatically. --pruned-block was set explicitly "
-                      "(skipping the SNIP search). Either leave --pruned-block at -1, or name the LoRA "
-                      "blocks explicitly with --lora-blocks instead.")
-    # Parse the explicit --lora-blocks list once, here, so a bad value fails fast.
-    lora_blocks_explicit = None
-    if args.lora_blocks is not None:
-        try:
-            lora_blocks_explicit = sorted({int(tok) for tok in args.lora_blocks.split(",") if tok.strip() != ""})
-        except ValueError:
-            parser.error(f"--lora-blocks must be a comma-separated list of integers, got: {args.lora_blocks!r}")
-        if len(lora_blocks_explicit) == 0:
-            parser.error("--lora-blocks was given but parsed to an empty set; pass at least one block index.")
-        if any(b < 0 for b in lora_blocks_explicit):
-            parser.error("--lora-blocks indices must be non-negative.")
-    args.lora_blocks_explicit = lora_blocks_explicit
-
-    # Interaction: restricting LoRA placement AND selective orthogonality together.
-    # Both rank by SNIP saliency, so if num_ortho_blocks <= num_lora_blocks the ortho
-    # set is a subset of the adapted set (correct). Only warn if the ortho budget
-    # could exceed the adapted set, which would request ortho on blocks with no LoRA
-    # (harmless -- no layer to attach to -- but a sign the flags disagree).
-    if args.num_ortho_blocks > 0:
-        if args.num_lora_blocks > 0 and args.num_ortho_blocks > args.num_lora_blocks:
-            print(f"[SFP] Warning: --num-ortho-blocks ({args.num_ortho_blocks}) > --num-lora-blocks "
-                  f"({args.num_lora_blocks}). Only the {args.num_lora_blocks} adapted blocks can carry the "
-                  f"orthogonality penalty; the extra ortho slots have no adapter to apply to.")
-        if lora_blocks_explicit is not None and args.num_ortho_blocks > len(lora_blocks_explicit):
-            print(f"[SFP] Warning: --num-ortho-blocks ({args.num_ortho_blocks}) exceeds the number of "
-                  f"explicitly-placed LoRA blocks ({len(lora_blocks_explicit)}). Ortho can only apply to "
-                  f"blocks that actually have an adapter.")
+    if args.block_selection_method == "ablation" and args.num_filter_blocks > 1:
+        parser.error("--block-selection-method ablation is only implemented for the single-block case "
+                      "(--num-filter-blocks 1, the default). Combining it with --num-filter-blocks > 1 "
+                      "is not currently supported.")
+    if args.block_selection_method == "ablation" and args.full_finetune:
+        parser.error("--block-selection-method ablation has no effect with --full-finetune (there's no "
+                      "block being replaced, so nothing to select). Drop one of the two flags.")
+    # No lower-bound check on --ablation-num-batches: 0 or negative is a valid,
+    # intentional value meaning "use the full dataset, no cap" (see
+    # ablation_selection.py). Previously this required >= 1, which blocked that
+    # option entirely.
+    if args.compensate_params and args.full_finetune:
+        parser.error("--compensate-params has no effect with --full-finetune (there's no filter-block "
+                      "replacement, hence no parameter deficit to compensate for). Drop one of the two flags.")
+    if args.compensate_params and args.lora_rank <= 0:
+        parser.error("--compensate-params requires --lora-rank > 0 (it works by increasing the LoRA/DoRA "
+                      "rank on the remaining blocks; with --lora-rank 0 there's no adapter capacity to "
+                      "increase). Set --lora-rank to a positive value, or drop --compensate-params.")
 
     # --mode is a thin, explicit selector over the three configurations the rest of
     # this script already supports individually (--full-finetune, plain SNIP+filter-
@@ -677,10 +696,12 @@ def main():
     snip_saliencies = None
     snip_plot_path = None
     filter_blocks = []
-    # Resolved LoRA placement (Step 1). Stays None when adapters go on every
-    # surviving block (default) or when there's no LoRA; set to the concrete list
-    # of adapted block indices when --lora-blocks / --num-lora-blocks restricts it.
-    lora_included_blocks = None
+    block_selection_comparison = None
+    removed_block_original_params = None
+    filter_block_params = None
+    lora_rank_base = args.lora_rank
+    lora_rank_effective = args.lora_rank
+    compensation_info = None
 
     if args.full_finetune:
         print("[SFP] --full-finetune set: skipping SNIP search, filter block substitution, "
@@ -690,15 +711,70 @@ def main():
             p.requires_grad = True
 
     elif args.num_filter_blocks == 1:
-        # Single-block path: identical behavior/logging to all previous versions.
+        # Single-block path: identical behavior/logging to all previous versions
+        # when --block-selection-method snip (the default) and --compensate-params
+        # isn't set.
         pruned_block_idx = args.pruned_block
+        block_selection_comparison = None  # only populated when method="ablation"
+
         if pruned_block_idx < 0:
-            print("[SFP] No block index provided. Running SNIP search...")
-            pruned_block_idx, snip_saliencies = select_block_with_snip(
-                model, train_loader, device=args.device, keep="low", return_scores=True
-            )
-            snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
-            print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+            if args.block_selection_method == "snip":
+                print("[SFP] No block index provided. Running SNIP search...")
+                pruned_block_idx, snip_saliencies = select_block_with_snip(
+                    model, train_loader, device=args.device, keep="low", return_scores=True
+                )
+                snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
+                print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+
+            else:  # args.block_selection_method == "ablation"
+                print("[SFP] No block index provided. Running block-ablation search "
+                      f"({args.ablation_num_batches} calibration batch(es) per block)...")
+                ablation_idx, ablation_result = select_block_with_ablation(
+                    model, train_loader, device=args.device, num_batches=args.ablation_num_batches,
+                    keep="low", return_scores=True
+                )
+                # Also run SNIP, purely so we can report which block SNIP would have
+                # picked vs. what ablation picked -- extra compute cost, only paid
+                # when you've explicitly opted into --block-selection-method ablation.
+                print("[SFP] Also running SNIP search for comparison (metadata only -- "
+                      "the block actually used below is the ABLATION result)...")
+                snip_idx, snip_saliencies = select_block_with_snip(
+                    model, train_loader, device=args.device, keep="low", return_scores=True
+                )
+
+                pruned_block_idx = ablation_idx
+                agree = (ablation_idx == snip_idx)
+                print(f"[SFP] SNIP would have selected block {snip_idx}; ablation selected block "
+                      f"{ablation_idx} ({'SAME block' if agree else 'DIFFERENT blocks'}). "
+                      f"Using the ABLATION result: block {pruned_block_idx}.")
+
+                block_selection_comparison = {
+                    "method_used": "ablation",
+                    "snip_selected_block": snip_idx,
+                    "snip_saliencies": {str(k): v for k, v in snip_saliencies.items()},
+                    "ablation_selected_block": ablation_idx,
+                    "ablation_baseline_loss": ablation_result["baseline_loss"],
+                    "ablation_baseline_acc": ablation_result["baseline_acc"],
+                    "ablation_num_calibration_samples": ablation_result["num_calibration_samples"],
+                    "ablation_num_calibration_batches": ablation_result["num_calibration_batches"],
+                    "ablation_per_block": {str(k): v for k, v in ablation_result["per_block"].items()},
+                    "methods_agree": agree,
+                    "final_selected_block": pruned_block_idx,
+                }
+                comparison_path = os.path.join(output_dir, "block_selection_comparison.json")
+                with open(comparison_path, "w") as f:
+                    json.dump(block_selection_comparison, f, indent=2)
+                print(f"[SFP] Saved SNIP-vs-ablation comparison metadata -> {comparison_path}")
+
+                snip_plot_path = plot_snip_saliency(snip_saliencies, snip_idx, output_dir)
+                print(f"[SFP] Saved SNIP saliency plot (for the comparison, not necessarily the block "
+                      f"actually used) -> {snip_plot_path}")
+
+        # Parameter count of the block ABOUT TO BE replaced -- must be measured
+        # BEFORE substitute_filter_block runs, since afterward the original Linear
+        # layers are gone. Always computed (cheap, just a parameter count) so it's
+        # available in metrics_summary.json even when --compensate-params isn't used.
+        removed_block_original_params = compute_block_target_param_count(model.blocks[pruned_block_idx])
 
         print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {pruned_block_idx}...")
         X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
@@ -711,24 +787,6 @@ def main():
             print(f"[SFP] Restricting orthogonality regularization to the top {args.num_ortho_blocks} "
                   f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
                   f"All other LoRA blocks use plain (unregularized) LoRA.")
-
-        # Static LoRA placement (Step 1): restrict adapters to a subset of blocks.
-        # --lora-blocks names them explicitly; --num-lora-blocks picks the top-k by
-        # SNIP saliency (excluding the filter-substituted block, same ranking used
-        # for orthogonality). None => adapt all surviving blocks (prior behavior).
-        if args.lora_rank > 0:
-            if args.lora_blocks_explicit is not None:
-                lora_included_blocks = args.lora_blocks_explicit
-                print(f"[SFP] Static LoRA placement: adapting only explicitly-named block(s) "
-                      f"{lora_included_blocks} (filter-substituted blocks are ignored).")
-            elif args.num_lora_blocks > 0:
-                lora_included_blocks = select_top_sensitive_blocks(
-                    snip_saliencies, [pruned_block_idx], args.num_lora_blocks
-                )
-                print(f"[SFP] Static SNIP-guided LoRA placement: adapting only the top "
-                      f"{args.num_lora_blocks} most task-sensitive block(s) (highest SNIP saliency): "
-                      f"{lora_included_blocks}. All other blocks stay frozen with no adapter.")
-        included_block_indices = lora_included_blocks
 
         filter_block = apply_single_filter_and_lora(
             model,
@@ -746,11 +804,56 @@ def main():
             init_method=args.init_method,
             loftq_bits=args.loftq_bits,
             loftq_iters=args.loftq_iters,
-            included_block_indices=included_block_indices,
         )
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
         filter_blocks = [filter_block]
         pruned_block_indices = [pruned_block_idx]
+
+        filter_block_params = sum(p.numel() for p in filter_block.parameters())
+        param_deficit = max(0, removed_block_original_params - filter_block_params)
+        lora_rank_base = args.lora_rank
+        lora_rank_effective = args.lora_rank
+        compensation_info = None
+
+        if args.compensate_params:
+            comp = compute_compensated_rank(
+                model, pruned_block_indices, base_rank=args.lora_rank, param_deficit=param_deficit
+            )
+            lora_rank_effective = comp["compensated_rank"]
+            compensation_info = {
+                "removed_block_original_params": removed_block_original_params,
+                "filter_block_params": filter_block_params,
+                "param_deficit": param_deficit,
+                "lora_rank_base": lora_rank_base,
+                "lora_rank_effective": lora_rank_effective,
+                "extra_rank": comp["extra_rank"],
+                "cost_per_rank_unit": comp["cost_per_rank_unit"],
+            }
+            print(f"[SFP] --compensate-params: block {pruned_block_idx}'s original target-layer params "
+                  f"({removed_block_original_params:,}) minus the filter block's own params "
+                  f"({filter_block_params:,}) = deficit of {param_deficit:,}. Compensating by raising "
+                  f"{args.adapter_type.upper()} rank from {lora_rank_base} to {lora_rank_effective} "
+                  f"(+{comp['extra_rank']} rank) on the remaining {len(model.blocks) - 1} block(s).")
+
+            if lora_rank_effective != lora_rank_base:
+                # Re-inject with the compensated rank: the adapters injected above
+                # (at lora_rank_base) get discarded and replaced -- wasteful to
+                # inject twice, but keeps this a small, easy-to-follow addition on
+                # top of the existing single-pass call above rather than
+                # restructuring apply_single_filter_and_lora's call site further.
+                from single_filter_lora import LoRALinear
+                for idx, block in enumerate(model.blocks):
+                    if idx == pruned_block_idx:
+                        continue
+                    for name, module in list(block.named_modules()):
+                        if isinstance(module, LoRALinear):
+                            parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                            parent = block if parent_name == "" else block.get_submodule(parent_name)
+                            setattr(parent, attr_name, module.base_layer)  # restore original nn.Linear
+                inject_lora(model, pruned_block_indices, lora_rank_effective, args.lora_alpha,
+                            args.lora_dropout, ortho_block_indices=ortho_block_indices,
+                            adapter_type=args.adapter_type, init_method=args.init_method,
+                            loftq_bits=args.loftq_bits, loftq_iters=args.loftq_iters)
 
     else:
         # Multi-block path (--num-filter-blocks > 1): SNIP auto-selects the N
@@ -791,33 +894,14 @@ def main():
                   f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
                   f"All other LoRA blocks use plain (unregularized) LoRA.")
 
-        # Static LoRA placement (Step 1), multi-filter case: same knobs as the
-        # single-block path. --lora-blocks names blocks explicitly; --num-lora-blocks
-        # takes the top-k by SNIP saliency excluding ALL filter-substituted blocks.
-        if args.lora_rank > 0:
-            if args.lora_blocks_explicit is not None:
-                lora_included_blocks = args.lora_blocks_explicit
-                print(f"[SFP] Static LoRA placement: adapting only explicitly-named block(s) "
-                      f"{lora_included_blocks} (filter-substituted blocks are ignored).")
-            elif args.num_lora_blocks > 0:
-                lora_included_blocks = select_top_sensitive_blocks(
-                    snip_saliencies, pruned_block_indices, args.num_lora_blocks
-                )
-                print(f"[SFP] Static SNIP-guided LoRA placement: adapting only the top "
-                      f"{args.num_lora_blocks} most task-sensitive block(s) (highest SNIP saliency): "
-                      f"{lora_included_blocks}. All other blocks stay frozen with no adapter.")
-        included_block_indices = lora_included_blocks
-
         lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout,
                                    ortho_block_indices=ortho_block_indices, adapter_type=args.adapter_type,
                                    init_method=args.init_method, loftq_bits=args.loftq_bits,
-                                   loftq_iters=args.loftq_iters, included_block_indices=included_block_indices)
+                                   loftq_iters=args.loftq_iters)
         ln_params = freeze_non_trainable(model, pruned_block_indices)
-        _placement_desc = (f"in blocks {included_block_indices}" if included_block_indices is not None
-                           else f"across all blocks except {pruned_block_indices}")
         print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
               f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
-              f"init={args.init_method}) {_placement_desc}.")
+              f"init={args.init_method}) across all blocks except {pruned_block_indices}.")
         print(f"[SFP-MultiFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
 
     # 6. Optimization Loop
@@ -980,6 +1064,7 @@ def main():
         misclassified_folder_name = build_misclassified_folder_name(
             full_finetune=args.full_finetune, lora_rank=args.lora_rank, adapter_type=args.adapter_type,
             init_method=args.init_method, ortho_enabled=ortho_enabled, seed=args.seed,
+            block_selection_method=args.block_selection_method, compensate_params=args.compensate_params,
         )
         test_loss, test_acc, misclassified_saved, misclassified_csv, misclassified_dir = (
             evaluate_and_save_misclassified(
@@ -1017,16 +1102,21 @@ def main():
         "filter_residual_hidden_dim": args.filter_residual_hidden_dim,
         "filter_residual_alpha": args.filter_residual_alpha if args.filter_residual_hidden_dim > 0 else None,
         "filter_residual_dropout": args.filter_residual_dropout if args.filter_residual_hidden_dim > 0 else None,
-        "lora_rank": args.lora_rank if not args.full_finetune else None,
+        "lora_rank": lora_rank_effective if not args.full_finetune else None,
+        "lora_rank_base": lora_rank_base if (not args.full_finetune and args.lora_rank > 0) else None,
         "num_ortho_blocks": args.num_ortho_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
-        "num_lora_blocks": args.num_lora_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
-        "lora_included_blocks": lora_included_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
         "adapter_type": args.adapter_type if (not args.full_finetune and args.lora_rank > 0) else None,
         "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
         "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0
                                            and args.init_method == "loftq") else None,
         "loftq_iters": args.loftq_iters if (not args.full_finetune and args.lora_rank > 0
                                              and args.init_method == "loftq") else None,
+        "block_selection_method": args.block_selection_method if not args.full_finetune else None,
+        "removed_block_original_params": removed_block_original_params,
+        "filter_block_params": filter_block_params,
+        "compensate_params": args.compensate_params,
+        "compensation_info": compensation_info,
+        "block_selection_comparison_available": block_selection_comparison is not None,
         "lora_alpha": args.lora_alpha if not args.full_finetune else None,
         "lora_dropout": args.lora_dropout if not args.full_finetune else None,
         "seed": args.seed,
@@ -1074,12 +1164,16 @@ def main():
         if args.lora_rank > 0:
             ortho_desc = (f" | Orthogonal reg: lambda1={args.lora_ortho_lambda1}, "
                            f"lambda2={args.lora_ortho_lambda2}") if ortho_enabled else ""
-            print(f"[SFP] Mode: SFT+LoRA{' (orthogonal)' if ortho_enabled else ''} | "
+            rank_desc = (f"{lora_rank_effective} (base {lora_rank_base}, compensated)"
+                         if lora_rank_effective != lora_rank_base else f"{lora_rank_effective}")
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()}{' (orthogonal)' if ortho_enabled else ''} | "
+                  f"Block selection: {args.block_selection_method} | "
                   f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
-                  f"LoRA rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}"
-                  f"{ortho_desc}")
+                  f"rank={rank_desc}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+                  f"init={args.init_method}{ortho_desc}")
         else:
-            print(f"[SFP] Mode: SFT-only (no LoRA) | Replaced Block(s): {pruned_block_indices} "
+            print(f"[SFP] Mode: SFT-only (no LoRA) | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} "
                   f"({layer_desc} Filter Block) | filter_dropout={args.filter_dropout}")
     print(f"[SFP] Trainable Params: {param_breakdown['trainable_params']:,} / "
           f"{param_breakdown['total_params']:,} ({param_breakdown['trainable_pct']:.2f}%)")
