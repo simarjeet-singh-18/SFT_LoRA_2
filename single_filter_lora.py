@@ -704,6 +704,119 @@ def select_top_sensitive_blocks(saliencies: dict, excluded_indices, num_blocks: 
     return sorted(idx for idx, _ in top)
 
 
+class PaCALinear(nn.Module):
+    """
+    PaCA (Partial Connection Adaptation, Woo et al. 2025, arXiv:2503.01905).
+
+    An alternative to LoRA/DoRA for making a linear layer trainable: instead of
+    adding a low-rank adapter path, PaCA fine-tunes only r selected COLUMNS of the
+    existing pretrained weight and freezes the rest. There is NO added adapter --
+    the forward pass is the same single matmul on the (partially updated) weight,
+    so unlike LoRA/DoRA nothing extra is inserted into the compute graph. "rank"
+    here means the number of trainable columns r (the paper's own terminology).
+
+    Weight W is (out_features, in_features). We pick r column indices; those columns
+    become the trainable parameter `paca_weight` (out_features, r), initialized to
+    their pretrained values so the layer equals the pretrained layer EXACTLY at init
+    (P is literally a slice of W). Every other column, and the bias, are frozen
+    buffers. Selection happens once at construction and is then fixed.
+
+    selection:
+      "random"  (default; the paper's choice -- their Section 5 shows random matches
+                importance-based selection): r columns chosen uniformly at random via
+                torch's global RNG, which train_sfp_lora.py seeds, so the choice is
+                reproducible across runs with the same --seed.
+      "weight"  the r columns with the largest L2 norm in the pretrained weight
+                (the paper's weight-based variant from Section 5).
+
+    The trainable parameter is named `paca_weight` so that freeze_non_trainable and
+    the optimizer's adapter param-group can recognize PaCA params by the "paca_"
+    substring, exactly mirroring how they key off "lora_". The frozen full weight is
+    kept as a buffer (so it saves/loads in the state_dict and moves with .to(device));
+    its selected columns are overwritten by paca_weight on each forward.
+
+    Note: this is a functionally faithful reproduction (identical trainable-parameter
+    set and math). The paper's kernel-level implementation also avoids storing full
+    input activations for memory savings; reconstructing W here does not replicate
+    that memory optimization, which is irrelevant to accuracy but means this version
+    does not deliver PaCA's training-memory reduction. See the summary notes.
+    """
+    def __init__(self, base_layer: nn.Linear, rank: int, selection: str = "random"):
+        super().__init__()
+        assert selection in ("random", "weight"), \
+            f"PaCA selection must be 'random' or 'weight', got {selection!r}"
+        out_f, in_f = base_layer.out_features, base_layer.in_features
+        assert 0 < rank <= in_f, (
+            f"PaCA rank (number of trainable columns) must satisfy 0 < rank <= in_features "
+            f"({in_f}) for this layer, got {rank}. On a ViT-B this caps at 768 for the "
+            f"qkv/proj/fc1 projections."
+        )
+        self.in_features, self.out_features, self.rank, self.selection = in_f, out_f, rank, selection
+
+        W = base_layer.weight.detach()
+        dev, dt = W.device, W.dtype
+
+        if selection == "weight":
+            col_norms = W.norm(p=2, dim=0)                      # (in_features,)
+            idx = torch.argsort(col_norms, descending=True)[:rank]
+        else:  # "random"
+            idx = torch.randperm(in_f, device=dev)[:rank]
+        idx = torch.sort(idx).values                            # ascending, for stable indexing/logging
+
+        self.register_buffer("selected_idx", idx.to(dev))
+        # Trainable slice = pretrained values of the selected columns.
+        self.paca_weight = nn.Parameter(W[:, idx].clone().to(device=dev, dtype=dt))
+        # Frozen full weight; its selected columns are overwritten in forward.
+        self.register_buffer("frozen_weight", W.clone())
+        if base_layer.bias is not None:
+            self.register_buffer("paca_bias", base_layer.bias.detach().clone())
+        else:
+            self.paca_bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Rebuild the effective weight: frozen columns from the buffer, r trainable
+        # columns from paca_weight. The scatter-assign is differentiable w.r.t.
+        # paca_weight, so gradients flow only to the selected columns.
+        W = self.frozen_weight.clone()
+        W[:, self.selected_idx] = self.paca_weight
+        return F.linear(x, W, self.paca_bias)
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, out_features={self.out_features}, "
+                f"rank(cols)={self.rank}, selection={self.selection}")
+
+
+def inject_paca(
+    model: nn.Module,
+    excluded_block_indices,
+    rank: int = 16,
+    selection: str = "random",
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+) -> int:
+    """
+    PaCA counterpart to inject_lora: replaces each target linear layer with a
+    PaCALinear (only r selected columns trainable) in every block EXCEPT the
+    filter-substituted ones (excluded_block_indices). Returns the total number of
+    trainable PaCA parameters (sum of out_features * r over the wrapped layers).
+
+    Mirrors inject_lora's block/keyword iteration exactly, so PaCA lands on the same
+    layers LoRA/DoRA would. Called by inject_lora when adapter_type="paca".
+    """
+    excluded = _normalize_indices(excluded_block_indices)
+    paca_params = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        for name, module in list(block.named_modules()):
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = block if parent_name == "" else block.get_submodule(parent_name)
+                paca_layer = PaCALinear(module, rank=rank, selection=selection)
+                setattr(parent, attr_name, paca_layer)
+                paca_params += module.out_features * rank
+    return paca_params
+
+
 def inject_lora(
     model: nn.Module,
     excluded_block_indices,
@@ -716,6 +829,7 @@ def inject_lora(
     init_method: str = "default",
     loftq_bits: int = 4,
     loftq_iters: int = 5,
+    paca_selection: str = "random",
 ) -> int:
     """
     Wraps target linear layers with LoRALinear in every block EXCEPT those in
@@ -738,7 +852,17 @@ def inject_lora(
 
     adapter_type / init_method / loftq_bits / loftq_iters: see LoRALinear's
     docstring. Applied identically to every injected layer.
+
+    adapter_type="paca": delegates to inject_paca -- PaCA trains r selected columns
+    of the pretrained weights instead of adding an adapter, so the LoRA-specific
+    arguments (alpha, dropout, ortho_block_indices, init_method, loftq_*) do not
+    apply and are ignored; lora_rank is reused as PaCA's column count r and
+    paca_selection chooses the column-selection strategy.
     """
+    if adapter_type == "paca":
+        return inject_paca(model, excluded_block_indices, rank=lora_rank,
+                           selection=paca_selection, target_keywords=target_keywords)
+
     excluded = _normalize_indices(excluded_block_indices)
     ortho_blocks = None if ortho_block_indices is None else _normalize_indices(ortho_block_indices)
     lora_params = 0
@@ -781,6 +905,7 @@ def freeze_non_trainable(model: nn.Module, filter_block_indices) -> int:
     for name, param in model.named_parameters():
         if (
             "lora_" in name
+            or "paca_" in name           # PaCA's trainable weight columns
             or any(f"blocks.{idx}" in name for idx in indices)
             or "head" in name
             or "norm" in name.lower()
@@ -809,6 +934,7 @@ def apply_single_filter_and_lora(
     init_method: str = "default",
     loftq_bits: int = 4,
     loftq_iters: int = 5,
+    paca_selection: str = "random",
 ):
     """
     Backward-compatible convenience wrapper for the SINGLE-block case, built on top
@@ -842,13 +968,18 @@ def apply_single_filter_and_lora(
     )
     lora_params = inject_lora(model, pruned_block_idx, lora_rank, lora_alpha, lora_dropout, target_keywords,
                                ortho_block_indices=ortho_block_indices, adapter_type=adapter_type,
-                               init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters)
+                               init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters,
+                               paca_selection=paca_selection)
     ln_params = freeze_non_trainable(model, pruned_block_idx)
 
     layer_desc = "Single" if filter_num_layers <= 1 else f"{filter_num_layers}-Layer"
     residual_desc = f" + residual(hidden={filter_residual_hidden_dim})" if filter_residual_hidden_dim > 0 else ""
     print(f"[SFP-SingleFilter] Substituted block {pruned_block_idx} with {layer_desc} Filter Block{residual_desc}.")
-    print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
-          f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, init={init_method}).")
+    if adapter_type == "paca":
+        print(f"[SFP-SingleFilter] Injected {lora_params:,} PACA parameters "
+              f"(trainable columns/rank={lora_rank}, selection={paca_selection}).")
+    else:
+        print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
+              f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, init={init_method}).")
     print(f"[SFP-SingleFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
     return filter_block

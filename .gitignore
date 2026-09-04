@@ -6,3 +6,6 @@ __pycache__/
 addition_trials/
 random_selection_experiments/
 legacy_code/
+all_blocks/
+all_blocks_substituition_leg/
+logs/

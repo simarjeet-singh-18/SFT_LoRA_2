@@ -2,6 +2,11 @@ import argparse
 import csv
 import json
 import os
+import time
+try:
+    import resource  # Unix-only; used for peak CPU RSS. Guarded for portability.
+except ImportError:
+    resource = None
 
 # Must be set BEFORE torch is imported / any CUDA context is created. Without this,
 # cuBLAS matmul kernels (Linear layers, attention, AdamW internals) can still use
@@ -385,7 +390,7 @@ def main():
                               "are all ignored when this is set. Equivalent to --mode full_finetune.")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
-    parser.add_argument("--adapter-type", type=str, default="lora", choices=["lora", "dora"],
+    parser.add_argument("--adapter-type", type=str, default="lora", choices=["lora", "dora", "paca"],
                          help="'lora' (default): standard low-rank adapter, W' = W_base + scaling*(B@A), "
                               "unchanged from all previous versions of this script. "
                               "'dora' (Weight-Decomposed Low-Rank Adaptation): decomposes each adapted "
@@ -400,7 +405,23 @@ def main():
                               "fine-tuning's update *direction*, at a small extra compute cost per forward "
                               "pass (an extra norm computation over W_base + scaling*(B@A)). Only affects "
                               "layers that have rank > 0; has no effect if --lora-rank 0 or "
-                              "--full-finetune.")
+                              "--full-finetune.\n"
+                              "'paca' (Partial Connection Adaptation, arXiv:2503.01905): NO adapter is "
+                              "added -- instead, r randomly selected COLUMNS of each target pretrained "
+                              "weight are made trainable and the rest of the weight is frozen. r is taken "
+                              "from --lora-rank (the paper calls it 'rank'), and --paca-selection chooses "
+                              "how the columns are picked. Since PaCA trains a slice of the real backbone "
+                              "weights rather than a low-rank adapter, --lora-alpha, --lora-dropout, "
+                              "--init-method loftq, the orthogonality flags, and --compensate-params do "
+                              "NOT apply and can't be combined with it. On a ViT-B, --lora-rank must be "
+                              "<= 768 (the qkv/proj/fc1 input dim). Slots in wherever LoRA/DoRA would "
+                              "(the non-filter blocks), so it composes with SFP substitution as usual.")
+    parser.add_argument("--paca-selection", type=str, default="random", choices=["random", "weight"],
+                         help="How --adapter-type paca picks which columns of each weight to train. "
+                              "'random' (default, the paper's choice -- their Sec.5 shows it matches "
+                              "importance-based selection): uniformly random columns, reproducible via "
+                              "--seed. 'weight': the r columns with the largest L2 norm in the pretrained "
+                              "weight (the paper's weight-based variant). Ignored unless --adapter-type paca.")
     parser.add_argument("--init-method", type=str, default="default", choices=["default", "loftq"],
                          help="'default' (unchanged): lora_A ~ Kaiming-uniform, lora_B = 0, base layer "
                               "weight kept at full precision. "
@@ -615,6 +636,24 @@ def main():
                       "rank on the remaining blocks; with --lora-rank 0 there's no adapter capacity to "
                       "increase). Set --lora-rank to a positive value, or drop --compensate-params.")
 
+    # --adapter-type paca (Partial Connection Adaptation) trains a slice of the real
+    # backbone weights instead of a low-rank adapter, so the LoRA/DoRA-specific knobs
+    # simply don't apply to it. Reject the incompatible combinations explicitly
+    # (rather than silently ignoring them) so a run's config can't be misread.
+    if args.adapter_type == "paca":
+        if args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0 or args.num_ortho_blocks > 0:
+            parser.error("--adapter-type paca has no LoRA A/B matrices to orthogonalize, so the "
+                          "orthogonality flags (--lora-ortho-lambda1/--lora-ortho-lambda2/"
+                          "--num-ortho-blocks) don't apply. Drop them, or use --adapter-type lora/dora.")
+        if args.init_method == "loftq":
+            parser.error("--init-method loftq is a LoRA/DoRA adapter initialization; it doesn't apply to "
+                          "--adapter-type paca (which has no adapter to initialize). Use --init-method "
+                          "default with paca.")
+        if args.compensate_params:
+            parser.error("--compensate-params computes a LoRA/DoRA-equivalent rank budget and doesn't "
+                          "apply to --adapter-type paca (whose trainable-parameter count is out_features*r "
+                          "per layer, a different accounting). Drop --compensate-params with paca.")
+
     # --mode is a thin, explicit selector over the three configurations the rest of
     # this script already supports individually (--full-finetune, plain SNIP+filter-
     # block SFT with LoRA off, and SNIP+filter-block SFT with LoRA + orthogonality
@@ -804,6 +843,7 @@ def main():
             init_method=args.init_method,
             loftq_bits=args.loftq_bits,
             loftq_iters=args.loftq_iters,
+            paca_selection=args.paca_selection,
         )
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
         filter_blocks = [filter_block]
@@ -897,22 +937,32 @@ def main():
         lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout,
                                    ortho_block_indices=ortho_block_indices, adapter_type=args.adapter_type,
                                    init_method=args.init_method, loftq_bits=args.loftq_bits,
-                                   loftq_iters=args.loftq_iters)
+                                   loftq_iters=args.loftq_iters, paca_selection=args.paca_selection)
         ln_params = freeze_non_trainable(model, pruned_block_indices)
-        print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
-              f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
-              f"init={args.init_method}) across all blocks except {pruned_block_indices}.")
+        if args.adapter_type == "paca":
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} PACA parameters "
+                  f"(trainable columns/rank={args.lora_rank}, selection={args.paca_selection}) "
+                  f"across all blocks except {pruned_block_indices}.")
+        else:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
+                  f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+                  f"init={args.init_method}) across all blocks except {pruned_block_indices}.")
         print(f"[SFP-MultiFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
 
     # 6. Optimization Loop
     model.to(args.device)
 
-    # Split trainable params into two groups since LoRA adapters and the filter
+    # Split trainable params into two groups since the adapter params and the filter
     # block / LayerNorm / head have very different scales and typically want
-    # different learning rates (LoRA is usually tuned lower, e.g. 1e-4 to 3e-4,
+    # different learning rates (adapters are usually tuned lower, e.g. 1e-4 to 3e-4,
     # while the full-rank filter block and LN/head can tolerate a higher LR).
-    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
-    main_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n]
+    # PaCA's trainable weight columns (named "paca_") are grouped WITH the adapters
+    # and get --lora-lr: they're a slice of the pretrained backbone, so the lower
+    # adapter LR (not the 1e-3 filter LR) is the safe default against forgetting.
+    def _is_adapter(n):
+        return "lora_" in n or "paca_" in n
+    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and _is_adapter(n)]
+    main_params = [p for n, p in model.named_parameters() if p.requires_grad and not _is_adapter(n)]
 
     optimizer = torch.optim.AdamW(
         [
@@ -962,7 +1012,8 @@ def main():
     best_val, best_epoch, best_path = 0.0, 0, os.path.join(output_dir, f"best_sfp_lora_{args.dataset}.pt")
     epochs_without_improvement = 0
 
-    history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": []}
+    history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": [],
+               "epoch_compute_s": []}
     ortho_enabled = (args.lora_ortho_lambda1 != 0.0) or (args.lora_ortho_lambda2 != 0.0)
     if ortho_enabled:
         history["train_ortho_loss"] = []
@@ -970,10 +1021,27 @@ def main():
               f"lambda1={args.lora_ortho_lambda1} (||A@A.T - I||^2), "
               f"lambda2={args.lora_ortho_lambda2} (||B.T@B - I||^2)")
 
+    # ---- Efficiency instrumentation (training time / memory / throughput) ----
+    # Lets us compare methods (SFT, LoRA, DoRA, PaCA, full-FT) on the same axes the
+    # PaCA paper reports. train-COMPUTE time = just the fwd/bwd/opt batch loop
+    # (excludes validation & checkpointing) so throughput is clean; train-WALL time
+    # is the whole training phase. Peak GPU memory is measured over the entire loop.
+    use_cuda = torch.cuda.is_available() and str(args.device).startswith("cuda")
+    if use_cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    total_train_compute_s = 0.0
+    total_train_samples = 0
+    train_wall_start = time.perf_counter()
+
     for epoch in range(1, effective_epochs + 1):
         model.train()
         running_loss = 0.0
         running_ortho_loss = 0.0
+        epoch_samples = 0
+        if use_cuda:
+            torch.cuda.synchronize()
+        epoch_compute_start = time.perf_counter()
         for batch in train_loader:
             x, y = batch[0].to(args.device), batch[1].to(args.device)
             optimizer.zero_grad()
@@ -994,8 +1062,17 @@ def main():
                 torch.nn.utils.clip_grad_norm_(main_params + lora_params, max_norm=args.grad_clip)
             optimizer.step()
             running_loss += task_loss.item() * x.size(0)
+            epoch_samples += x.size(0)
             if ortho_enabled:
                 running_ortho_loss += ortho_loss.item() * x.size(0)
+
+        # Close the compute timer for this epoch BEFORE validation, so throughput
+        # reflects training only. Synchronize first so async CUDA kernels are counted.
+        if use_cuda:
+            torch.cuda.synchronize()
+        epoch_compute_s = time.perf_counter() - epoch_compute_start
+        total_train_compute_s += epoch_compute_s
+        total_train_samples += epoch_samples
 
         epoch_loss = running_loss / len(train_loader.dataset)
         epoch_ortho_loss = running_ortho_loss / len(train_loader.dataset) if ortho_enabled else None
@@ -1012,6 +1089,7 @@ def main():
         history["val_acc"].append(val_acc)
         history["lr_main"].append(lr_main_now)
         history["lr_lora"].append(lr_lora_now)
+        history["epoch_compute_s"].append(epoch_compute_s)
         if ortho_enabled:
             history["train_ortho_loss"].append(epoch_ortho_loss)
 
@@ -1042,6 +1120,73 @@ def main():
             print(f"[SFP] Early stopping triggered: no val-acc improvement for {args.patience} "
                   f"epoch(s) (best={best_val:.2f}% @ epoch {best_epoch}). Stopping at epoch {epoch}.")
             break
+
+    # ---- Aggregate efficiency metrics (time / memory / throughput) ----
+    total_train_wall_s = time.perf_counter() - train_wall_start
+    epochs_done = max(1, len(history["epoch"]))
+    avg_epoch_compute_s = total_train_compute_s / epochs_done
+    first_epoch_compute_s = history["epoch_compute_s"][0] if history["epoch_compute_s"] else None
+    # Steady-state excludes epoch 1 (cuDNN autotune, lazy allocation, dataset
+    # warm-up) for a fairer throughput; falls back to the single epoch otherwise.
+    if epochs_done > 1:
+        steady_state_epoch_compute_s = sum(history["epoch_compute_s"][1:]) / (epochs_done - 1)
+    else:
+        steady_state_epoch_compute_s = avg_epoch_compute_s
+    samples_per_epoch = total_train_samples / epochs_done
+    throughput_samples_per_sec = (total_train_samples / total_train_compute_s) if total_train_compute_s > 0 else None
+    steady_state_throughput_samples_per_sec = (
+        samples_per_epoch / steady_state_epoch_compute_s if steady_state_epoch_compute_s > 0 else None
+    )
+
+    peak_gpu_mem_allocated_mb = None
+    peak_gpu_mem_reserved_mb = None
+    if use_cuda:
+        peak_gpu_mem_allocated_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        peak_gpu_mem_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    peak_cpu_rss_mb = None
+    if resource is not None:
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KB on Linux, bytes on macOS.
+        peak_cpu_rss_mb = ru / (1024 ** 2) if sys.platform == "darwin" else ru / 1024
+
+    # total_params must be comparable ACROSS methods. PaCA stores each layer's frozen
+    # weight (and bias) as BUFFERS, not Parameters, so a plain model.parameters() sum
+    # undercounts the real model size for PaCA (only ~2M vs ~86M) and would make its
+    # trainable-% look ~40x too high next to LoRA/DoRA. Reconstruct the true size:
+    # start from all Parameters, add PaCA's frozen weight/bias buffers, and subtract
+    # the trainable paca_weight copies (their columns already live inside frozen_weight,
+    # so counting both double-counts them). For non-PaCA runs there are no such buffers,
+    # so this equals the plain parameter count exactly.
+    _trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _total_params = sum(p.numel() for p in model.parameters())
+    for _n, _b in model.named_buffers():
+        if _n.endswith("frozen_weight") or _n.endswith("paca_bias"):
+            _total_params += _b.numel()
+    for _n, _p in model.named_parameters():
+        if _n.endswith("paca_weight"):
+            _total_params -= _p.numel()
+
+    efficiency = {
+        "device": str(args.device),
+        "batch_size": args.batch_size,
+        "trainable_params": _trainable_params,
+        "total_params": _total_params,
+        "epochs_trained": epochs_done,
+        "train_samples_processed": total_train_samples,
+        "train_compute_seconds": round(total_train_compute_s, 4),
+        "train_wall_seconds": round(total_train_wall_s, 4),
+        "avg_epoch_compute_seconds": round(avg_epoch_compute_s, 4),
+        "first_epoch_compute_seconds": round(first_epoch_compute_s, 4) if first_epoch_compute_s is not None else None,
+        "steady_state_epoch_compute_seconds": round(steady_state_epoch_compute_s, 4),
+        "throughput_samples_per_sec": round(throughput_samples_per_sec, 2) if throughput_samples_per_sec else None,
+        "steady_state_throughput_samples_per_sec": round(steady_state_throughput_samples_per_sec, 2) if steady_state_throughput_samples_per_sec else None,
+        "peak_gpu_mem_allocated_mb": round(peak_gpu_mem_allocated_mb, 1) if peak_gpu_mem_allocated_mb is not None else None,
+        "peak_gpu_mem_reserved_mb": round(peak_gpu_mem_reserved_mb, 1) if peak_gpu_mem_reserved_mb is not None else None,
+        "peak_cpu_rss_mb": round(peak_cpu_rss_mb, 1) if peak_cpu_rss_mb is not None else None,
+    }
+    efficiency["trainable_pct"] = round(
+        100.0 * efficiency["trainable_params"] / efficiency["total_params"], 4
+    ) if efficiency["total_params"] > 0 else None
 
     # Save curves + raw per-epoch history as soon as training finishes, so they exist
     # even if something later (checkpoint reload, test eval) fails.
@@ -1106,6 +1251,7 @@ def main():
         "lora_rank_base": lora_rank_base if (not args.full_finetune and args.lora_rank > 0) else None,
         "num_ortho_blocks": args.num_ortho_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
         "adapter_type": args.adapter_type if (not args.full_finetune and args.lora_rank > 0) else None,
+        "paca_selection": args.paca_selection if (not args.full_finetune and args.lora_rank > 0 and args.adapter_type == "paca") else None,
         "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
         "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0
                                            and args.init_method == "loftq") else None,
@@ -1136,6 +1282,7 @@ def main():
         "best_epoch": best_epoch,
         "final_test_acc": test_acc,
         "final_test_loss": test_loss,
+        "efficiency": efficiency,
         "param_breakdown": param_breakdown,
         "plots": {
             **curve_paths,
@@ -1161,7 +1308,11 @@ def main():
         print(f"[SFP] Mode: FULL FINE-TUNE (baseline, no SFP/LoRA)")
     else:
         layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
-        if args.lora_rank > 0:
+        if args.lora_rank > 0 and args.adapter_type == "paca":
+            print(f"[SFP] Mode: SFT+PACA | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"trainable columns/rank={args.lora_rank}, selection={args.paca_selection}")
+        elif args.lora_rank > 0:
             ortho_desc = (f" | Orthogonal reg: lambda1={args.lora_ortho_lambda1}, "
                            f"lambda2={args.lora_ortho_lambda2}") if ortho_enabled else ""
             rank_desc = (f"{lora_rank_effective} (base {lora_rank_base}, compensated)"
@@ -1184,6 +1335,20 @@ def main():
     print(f"[SFP]   - Trainable backbone: {param_breakdown['trainable_backbone']:,}")
     print(f"[SFP] Best Val Acc: {best_val:.2f}% (epoch {best_epoch})")
     print(f"[SFP] Final Test Acc: {test_acc:.2f}% | Final Test Loss: {test_loss:.4f}")
+    gpu_mem_disp = (f"{efficiency['peak_gpu_mem_reserved_mb']:.0f} MB reserved "
+                    f"({efficiency['peak_gpu_mem_allocated_mb']:.0f} MB allocated)"
+                    if efficiency['peak_gpu_mem_reserved_mb'] is not None else "n/a (CPU)")
+    tput_disp = (f"{efficiency['steady_state_throughput_samples_per_sec']:.1f}"
+                 if efficiency['steady_state_throughput_samples_per_sec'] is not None else "n/a")
+    print(f"[SFP] Efficiency ({efficiency['device']}, bs={efficiency['batch_size']}): "
+          f"train compute {efficiency['train_compute_seconds']:.1f}s over {efficiency['epochs_trained']} epoch(s) "
+          f"(wall {efficiency['train_wall_seconds']:.1f}s incl. val)")
+    print(f"[SFP]   - Trainable params: {efficiency['trainable_params']:,} / {efficiency['total_params']:,} "
+          f"({efficiency['trainable_pct']:.2f}%)")
+    print(f"[SFP]   - Avg epoch: {efficiency['avg_epoch_compute_seconds']:.2f}s "
+          f"(1st {efficiency['first_epoch_compute_seconds']:.2f}s, steady {efficiency['steady_state_epoch_compute_seconds']:.2f}s)")
+    print(f"[SFP]   - Throughput: {tput_disp} samples/s (steady-state) | Peak GPU mem: {gpu_mem_disp}"
+          + (f" | Peak CPU RSS: {efficiency['peak_cpu_rss_mb']:.0f} MB" if efficiency['peak_cpu_rss_mb'] is not None else ""))
     if args.save_misclassified_images:
         print(f"[SFP] Misclassified images saved: {misclassified_saved} -> {misclassified_dir}")
     print(f"[SFP] All plots, CSV history, and metrics JSON saved under: {output_dir}")
