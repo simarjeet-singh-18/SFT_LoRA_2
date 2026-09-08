@@ -162,6 +162,127 @@ def evaluate_full(model: nn.Module, dataloader: DataLoader, device: str, criteri
     return avg_loss, acc
 
 
+def compute_block_output_metrics(model: nn.Module, dataloader: DataLoader, device: str,
+                                  num_batches: int = 10):
+    """
+    Redundancy probe across every pair of blocks (i, j), computed in a single hooked
+    forward pass and returned as four (n_blocks x n_blocks) matrices:
+
+      "pearson"   : average per-sample Pearson CORRELATION between the two blocks'
+                    flattened outputs (centered, normalized). Range [-1, 1], diag 1.
+                    High = the later block barely changed the representation.
+      "cosine"    : average per-sample COSINE SIMILARITY (uncentered, normalized).
+                    Range [-1, 1], diag 1. Like pearson but keeps the mean/offset.
+      "euclidean" : average per-sample EUCLIDEAN (L2) DISTANCE ||o_i - o_j||_2 between
+                    the flattened outputs. >= 0, diag 0. Magnitude grows with feature
+                    count and activation scale, so read it relatively.
+      "rmse"      : average per-sample ROOT-MEAN-SQUARED-ERROR sqrt(mean((o_i-o_j)^2))
+                    = euclidean / sqrt(F). >= 0, diag 0. A scale-per-element version of
+                    the euclidean distance that's comparable across feature dims.
+
+    Intuition (same for all four): ViT blocks are residual, so if a block barely
+    transforms its input its output stays close to the previous block's -- high
+    similarity / low distance flags a redundant transformation. Residual structure
+    makes neighbors inherently similar, so compare values relatively.
+
+    For each sample we flatten block i's output (tokens x embed_dim) into one vector
+    and block j's into another, compute each metric between those two vectors, and
+    average over every sample seen (up to num_batches batches). Runs under no_grad on
+    model.eval(); hooks every entry of model.blocks, so it is method-agnostic (a
+    substituted filter block is just another entry). Returns a dict of numpy arrays,
+    or None if no samples were seen.
+    """
+    import numpy as np
+    n_blocks = len(model.blocks)
+    captured = {}
+
+    def make_hook(idx):
+        def hook(module, inp, out):
+            captured[idx] = (out[0] if isinstance(out, (tuple, list)) else out).detach()
+        return hook
+
+    hooks = [blk.register_forward_hook(make_hook(i)) for i, blk in enumerate(model.blocks)]
+
+    sums = {k: np.zeros((n_blocks, n_blocks), dtype=np.float64)
+            for k in ("pearson", "cosine", "euclidean", "rmse")}
+    total_samples = 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for b, batch in enumerate(dataloader):
+                if b >= num_batches:
+                    break
+                x = batch[0].to(device)
+                captured.clear()
+                _ = model(x)
+                bs = x.size(0)
+                # Per-sample flatten -> (bs, F); precompute centered versions + norms.
+                flats, cents, raw_norms, cen_norms = [], [], [], []
+                F_dim = None
+                for i in range(n_blocks):
+                    f = captured[i].reshape(bs, -1).float()
+                    F_dim = f.shape[1]
+                    fc = f - f.mean(dim=1, keepdim=True)
+                    flats.append(f)
+                    cents.append(fc)
+                    raw_norms.append(torch.sqrt((f * f).sum(dim=1)).clamp_min(1e-12))
+                    cen_norms.append(torch.sqrt((fc * fc).sum(dim=1)).clamp_min(1e-12))
+                sqrtF = float(F_dim) ** 0.5
+                for i in range(n_blocks):
+                    for j in range(i, n_blocks):
+                        pear = ((cents[i] * cents[j]).sum(dim=1) / (cen_norms[i] * cen_norms[j]))
+                        cos = ((flats[i] * flats[j]).sum(dim=1) / (raw_norms[i] * raw_norms[j]))
+                        diff = flats[i] - flats[j]
+                        eucl = torch.sqrt((diff * diff).sum(dim=1).clamp_min(0.0))
+                        rmse = eucl / sqrtF
+                        vals = {"pearson": float(pear.sum().item()),
+                                "cosine": float(cos.sum().item()),
+                                "euclidean": float(eucl.sum().item()),
+                                "rmse": float(rmse.sum().item())}
+                        for k, s in vals.items():
+                            sums[k][i, j] += s
+                            if i != j:
+                                sums[k][j, i] += s
+                total_samples += bs
+    finally:
+        for h in hooks:
+            h.remove()
+        if was_training:
+            model.train()
+
+    if total_samples == 0:
+        return None
+    return {k: (m / total_samples) for k, m in sums.items()}
+
+
+def print_block_metric_matrix(matrix, title: str, value_fmt: str = "{:7.3f}"):
+    """Pretty-print one block-pair metric matrix to the console."""
+    n = matrix.shape[0]
+    cell_w = len(value_fmt.format(0.0))
+    print(f"[SFP] {title}")
+    header = " " * 6 + "".join(f"{'B'+str(j):>{cell_w+1}}" for j in range(n))
+    print(header)
+    for i in range(n):
+        cells = "".join(" " + value_fmt.format(matrix[i, j]) for j in range(n))
+        print(f"  B{i:<3d}{cells}")
+
+
+def save_block_metric_csv(matrix, save_dir: str, filename: str) -> str:
+    """
+    Write one block-pair metric matrix to <filename> in save_dir (rows/cols labeled
+    block_0..block_{n-1}; symmetric).
+    """
+    path = os.path.join(save_dir, filename)
+    n = matrix.shape[0]
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + [f"block_{j}" for j in range(n)])
+        for i in range(n):
+            writer.writerow([f"block_{i}"] + [f"{matrix[i, j]:.6f}" for j in range(n)])
+    return path
+
+
 def denormalize(tensor: torch.Tensor, mean: list, std: list) -> torch.Tensor:
     """Undoes transforms.Normalize so images can be saved as viewable PNGs."""
     mean_t = torch.tensor(mean, device=tensor.device).view(1, -1, 1, 1)
@@ -487,6 +608,23 @@ def main():
                               "otherwise. Requires SNIP saliency scores to be available, i.e. --pruned-block "
                               "must be left at its default (-1) so the automatic SNIP search actually runs -- "
                               "see the validation check below for the manual --pruned-block case.")
+    parser.add_argument("--block-correlation", action="store_true",
+                         help="After training, compute pairwise redundancy metrics between the OUTPUT "
+                              "activations of every transformer block (block i vs block j, all "
+                              "combinations): Pearson correlation, cosine similarity, Euclidean distance, "
+                              "and RMSE. High correlation/cosine (or low distance/RMSE) between blocks "
+                              "means the later block barely transformed the representation. Prints one "
+                              "matrix per metric and writes block_output_correlation.csv, "
+                              "block_output_cosine_similarity.csv, block_output_euclidean_distance.csv, "
+                              "and block_output_rmse.csv. Works for every method (SFT, SFT+LoRA, SFT+DoRA, "
+                              "SFT+PaCA, full-finetune) since it just hooks each block's output; a "
+                              "substituted filter block is included as one of the blocks. Each metric is "
+                              "averaged over samples of its per-sample value between the two blocks' "
+                              "flattened outputs, measured on the val set.")
+    parser.add_argument("--block-correlation-batches", type=int, default=10,
+                         help="Number of val-set batches to use for --block-correlation (default 10). More "
+                              "batches = a steadier estimate at higher cost. Ignored unless "
+                              "--block-correlation is set.")
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
 
     parser.add_argument("--block-selection-method", type=str, default="snip", choices=["snip", "ablation"],
@@ -599,6 +737,8 @@ def main():
         parser.error("--patience must be a positive integer.")
     if args.num_filter_blocks < 1:
         parser.error("--num-filter-blocks must be >= 1.")
+    if args.block_correlation and args.block_correlation_batches < 1:
+        parser.error("--block-correlation-batches must be >= 1.")
     if args.filter_block_layers < 1:
         parser.error("--filter-block-layers must be >= 1.")
     if args.filter_residual_hidden_dim < 0:
@@ -1226,6 +1366,33 @@ def main():
     param_plot_path = plot_param_breakdown(param_breakdown, output_dir)
     print(f"[SFP] Saved parameter breakdown plot -> {param_plot_path}")
 
+    # Optional block-output redundancy probe (measured on the restored best model).
+    block_metric_csvs = None
+    if args.block_correlation:
+        print(f"[SFP] Computing block-output metrics (pearson / cosine / euclidean / rmse) over up to "
+              f"{args.block_correlation_batches} val batch(es)...")
+        metrics = compute_block_output_metrics(
+            model, val_loader, args.device, num_batches=args.block_correlation_batches
+        )
+        if metrics is not None:
+            specs = [
+                ("pearson",   "Block-output PEARSON CORRELATION (avg per-sample; high = redundant)",
+                 "{:7.3f}", "block_output_correlation.csv"),
+                ("cosine",    "Block-output COSINE SIMILARITY (avg per-sample; high = redundant)",
+                 "{:7.3f}", "block_output_cosine_similarity.csv"),
+                ("euclidean", "Block-output EUCLIDEAN DISTANCE (avg per-sample; low = redundant)",
+                 "{:9.2f}", "block_output_euclidean_distance.csv"),
+                ("rmse",      "Block-output RMSE (avg per-sample; low = redundant)",
+                 "{:8.4f}", "block_output_rmse.csv"),
+            ]
+            block_metric_csvs = {}
+            for key, title, fmt, fname in specs:
+                print_block_metric_matrix(metrics[key], title, value_fmt=fmt)
+                block_metric_csvs[key] = save_block_metric_csv(metrics[key], output_dir, fname)
+            print(f"[SFP] Saved block-output metric CSVs -> {', '.join(block_metric_csvs.values())}")
+        else:
+            print("[SFP] Block-output metrics skipped: no validation samples available.")
+
     if args.full_finetune:
         resolved_mode = "full_finetune"
     elif args.lora_rank > 0:
@@ -1283,6 +1450,7 @@ def main():
         "final_test_acc": test_acc,
         "final_test_loss": test_loss,
         "efficiency": efficiency,
+        "block_metric_csvs": block_metric_csvs,
         "param_breakdown": param_breakdown,
         "plots": {
             **curve_paths,
