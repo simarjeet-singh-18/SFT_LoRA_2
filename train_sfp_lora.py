@@ -35,6 +35,7 @@ from single_filter_lora import (
     select_top_sensitive_blocks,
     compute_block_target_param_count,
     compute_compensated_rank,
+    resample_all_paca,
 )
 from snip_selection import select_block_with_snip, select_blocks_with_snip
 from ablation_selection import select_block_with_ablation
@@ -511,7 +512,7 @@ def main():
                               "are all ignored when this is set. Equivalent to --mode full_finetune.")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
-    parser.add_argument("--adapter-type", type=str, default="lora", choices=["lora", "dora", "paca"],
+    parser.add_argument("--adapter-type", type=str, default="lora", choices=["lora", "dora", "paca", "rpaca"],
                          help="'lora' (default): standard low-rank adapter, W' = W_base + scaling*(B@A), "
                               "unchanged from all previous versions of this script. "
                               "'dora' (Weight-Decomposed Low-Rank Adaptation): decomposes each adapted "
@@ -538,11 +539,31 @@ def main():
                               "<= 768 (the qkv/proj/fc1 input dim). Slots in wherever LoRA/DoRA would "
                               "(the non-filter blocks), so it composes with SFP substitution as usual.")
     parser.add_argument("--paca-selection", type=str, default="random", choices=["random", "weight"],
-                         help="How --adapter-type paca picks which columns of each weight to train. "
+                         help="How --adapter-type paca/rpaca picks which columns of each weight to train. "
                               "'random' (default, the paper's choice -- their Sec.5 shows it matches "
                               "importance-based selection): uniformly random columns, reproducible via "
                               "--seed. 'weight': the r columns with the largest L2 norm in the pretrained "
-                              "weight (the paper's weight-based variant). Ignored unless --adapter-type paca.")
+                              "weight (the paper's weight-based variant). For --adapter-type rpaca this only "
+                              "sets the FIRST epoch's columns; every later epoch re-selects randomly. "
+                              "Ignored unless --adapter-type is paca or rpaca.")
+    parser.add_argument("--paca-tuner", type=str, default="direct", choices=["direct", "lora", "dora"],
+                         help="How the PaCA/RPaCA-selected columns are TUNED. 'direct' (default): train the "
+                              "selected columns themselves (out*r params/layer) -- the original PaCA/RPaCA. "
+                              "'lora'/'dora': the FUSED method -- instead of training the columns directly, "
+                              "attach a rank-(--paca-adapter-rank) LoRA/DoRA adapter that tunes ONLY the "
+                              "selected columns, cutting trainable params to k*(r+out)[+out] < out*r. "
+                              "Orthogonalization (--lora-ortho-lambda1/2, --num-ortho-blocks) applies to "
+                              "the fused adapter's A/B matrices. Ignored unless --adapter-type is paca/rpaca.")
+    parser.add_argument("--paca-rank", type=int, default=-1,
+                         help="Number of columns PaCA/RPaCA selects per layer (the paper's 'rank' r). "
+                              "-1 (default) falls back to --lora-rank, so existing paca commands keep "
+                              "working. On a ViT-B, r <= 768 for qkv/proj/fc1. Ignored unless "
+                              "--adapter-type is paca or rpaca.")
+    parser.add_argument("--paca-adapter-rank", type=int, default=-1,
+                         help="Rank k of the fused LoRA/DoRA adapter that tunes the selected columns "
+                              "(only used when --paca-tuner is lora or dora). Must satisfy 0 < k <= r "
+                              "(fewer than the number of selected columns) for the fusion to reduce params. "
+                              "Required when --paca-tuner != direct.")
     parser.add_argument("--init-method", type=str, default="default", choices=["default", "loftq"],
                          help="'default' (unchanged): lora_A ~ Kaiming-uniform, lora_B = 0, base layer "
                               "weight kept at full precision. "
@@ -695,9 +716,9 @@ def main():
                               "mode). Also used as the cosine LR schedule's horizon in that mode, "
                               "since the actual stopping epoch isn't known in advance. Ignored "
                               "when --epochs is set to a positive value.")
-    parser.add_argument("--warmup-epochs", type=int, default=0,
+    parser.add_argument("--warmup-epochs", type=int, default=2,
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.0,
+    parser.add_argument("--min-lr-ratio", type=float, default=0.01,
                          help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
     parser.add_argument("--grad-clip", type=float, default=0.0,
                          help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
@@ -776,23 +797,41 @@ def main():
                       "rank on the remaining blocks; with --lora-rank 0 there's no adapter capacity to "
                       "increase). Set --lora-rank to a positive value, or drop --compensate-params.")
 
-    # --adapter-type paca (Partial Connection Adaptation) trains a slice of the real
-    # backbone weights instead of a low-rank adapter, so the LoRA/DoRA-specific knobs
-    # simply don't apply to it. Reject the incompatible combinations explicitly
-    # (rather than silently ignoring them) so a run's config can't be misread.
-    if args.adapter_type == "paca":
-        if args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0 or args.num_ortho_blocks > 0:
-            parser.error("--adapter-type paca has no LoRA A/B matrices to orthogonalize, so the "
-                          "orthogonality flags (--lora-ortho-lambda1/--lora-ortho-lambda2/"
-                          "--num-ortho-blocks) don't apply. Drop them, or use --adapter-type lora/dora.")
+    # --adapter-type paca/rpaca select+train columns of the real backbone weights.
+    # With the DIRECT tuner there are no adapter A/B matrices, so LoRA/DoRA-specific
+    # knobs don't apply; with a FUSED tuner (lora/dora) the adapter DOES exist, so
+    # orthogonalization is allowed there. Reject only the genuinely-incompatible
+    # combinations, explicitly, so a run's config can't be misread.
+    if args.adapter_type in ("paca", "rpaca"):
+        fused = args.paca_tuner in ("lora", "dora")
+        if not fused and (args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0
+                          or args.num_ortho_blocks > 0):
+            parser.error(f"--adapter-type {args.adapter_type} with --paca-tuner direct trains the selected "
+                          "columns directly (no adapter A/B matrices to orthogonalize), so the "
+                          "orthogonality flags don't apply. Use --paca-tuner lora/dora to enable a fused "
+                          "adapter you can orthogonalize, or drop the orthogonality flags.")
         if args.init_method == "loftq":
-            parser.error("--init-method loftq is a LoRA/DoRA adapter initialization; it doesn't apply to "
-                          "--adapter-type paca (which has no adapter to initialize). Use --init-method "
-                          "default with paca.")
+            parser.error(f"--init-method loftq is a LoRA/DoRA adapter initialization; it doesn't apply to "
+                          f"--adapter-type {args.adapter_type}. Use --init-method default.")
         if args.compensate_params:
-            parser.error("--compensate-params computes a LoRA/DoRA-equivalent rank budget and doesn't "
-                          "apply to --adapter-type paca (whose trainable-parameter count is out_features*r "
-                          "per layer, a different accounting). Drop --compensate-params with paca.")
+            parser.error(f"--compensate-params computes a LoRA/DoRA-equivalent rank budget and doesn't "
+                          f"apply to --adapter-type {args.adapter_type}. Drop --compensate-params.")
+        cols = args.paca_rank if args.paca_rank > 0 else args.lora_rank
+        if cols <= 0:
+            parser.error(f"--adapter-type {args.adapter_type} needs a positive column count: set --paca-rank "
+                          "(preferred) or --lora-rank > 0.")
+        if fused:
+            if args.paca_adapter_rank <= 0:
+                parser.error(f"--paca-tuner {args.paca_tuner} (fused) requires --paca-adapter-rank > 0 (the "
+                              "rank k of the adapter that tunes the selected columns).")
+            if args.paca_adapter_rank > cols:
+                parser.error(f"--paca-adapter-rank ({args.paca_adapter_rank}) must be <= the column count r "
+                              f"({cols}) for the fused adapter to reduce parameters below direct PaCA.")
+    else:
+        if args.paca_tuner != "direct":
+            parser.error("--paca-tuner only applies to --adapter-type paca/rpaca.")
+        if args.paca_rank > 0 or args.paca_adapter_rank > 0:
+            parser.error("--paca-rank / --paca-adapter-rank only apply to --adapter-type paca/rpaca.")
 
     # --mode is a thin, explicit selector over the three configurations the rest of
     # this script already supports individually (--full-finetune, plain SNIP+filter-
@@ -839,6 +878,15 @@ def main():
 
     early_stopping_enabled = (args.epochs == -1)
     effective_epochs = args.max_epochs if early_stopping_enabled else args.epochs
+
+    # PaCA/RPaCA helpers (used by injection, the RPaCA epoch hook, and reporting):
+    is_paca_family = args.adapter_type in ("paca", "rpaca")
+    is_rpaca = args.adapter_type == "rpaca"
+    paca_is_fused = is_paca_family and args.paca_tuner in ("lora", "dora")
+    paca_cols = (args.paca_rank if args.paca_rank > 0 else args.lora_rank) if is_paca_family else 0
+    # Whether the run has A/B adapter matrices the orthogonality penalty can act on
+    # (standalone LoRA/DoRA, or a fused PaCA/RPaCA tuner).
+    has_ab_adapter = (args.adapter_type in ("lora", "dora") and args.lora_rank > 0) or paca_is_fused
 
     # The --lr default (1e-3) was tuned for SFP's tiny filter block + LN + head
     # (~0.6-2.8M params). Applied to the ENTIRE pretrained backbone in --full-finetune
@@ -959,13 +1007,13 @@ def main():
         X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
 
         ortho_block_indices = None
-        if args.num_ortho_blocks > 0 and args.lora_rank > 0:
+        if args.num_ortho_blocks > 0 and has_ab_adapter:
             ortho_block_indices = select_top_sensitive_blocks(
                 snip_saliencies, [pruned_block_idx], args.num_ortho_blocks
             )
             print(f"[SFP] Restricting orthogonality regularization to the top {args.num_ortho_blocks} "
-                  f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
-                  f"All other LoRA blocks use plain (unregularized) LoRA.")
+                  f"most task-sensitive adapter block(s) (highest SNIP saliency): {ortho_block_indices}. "
+                  f"All other adapter blocks use plain (unregularized) adapters.")
 
         filter_block = apply_single_filter_and_lora(
             model,
@@ -984,6 +1032,9 @@ def main():
             loftq_bits=args.loftq_bits,
             loftq_iters=args.loftq_iters,
             paca_selection=args.paca_selection,
+            paca_tuner=args.paca_tuner,
+            paca_rank=args.paca_rank,
+            paca_adapter_rank=args.paca_adapter_rank,
         )
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
         filter_blocks = [filter_block]
@@ -1066,22 +1117,29 @@ def main():
             print(f"[SFP-MultiFilter] Substituted block {idx} with {layer_desc} Filter Block{residual_desc}.")
 
         ortho_block_indices = None
-        if args.num_ortho_blocks > 0 and args.lora_rank > 0:
+        if args.num_ortho_blocks > 0 and has_ab_adapter:
             ortho_block_indices = select_top_sensitive_blocks(
                 snip_saliencies, pruned_block_indices, args.num_ortho_blocks
             )
             print(f"[SFP] Restricting orthogonality regularization to the top {args.num_ortho_blocks} "
-                  f"most task-sensitive LoRA block(s) (highest SNIP saliency): {ortho_block_indices}. "
-                  f"All other LoRA blocks use plain (unregularized) LoRA.")
+                  f"most task-sensitive adapter block(s) (highest SNIP saliency): {ortho_block_indices}. "
+                  f"All other adapter blocks use plain (unregularized) adapters.")
 
         lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout,
                                    ortho_block_indices=ortho_block_indices, adapter_type=args.adapter_type,
                                    init_method=args.init_method, loftq_bits=args.loftq_bits,
-                                   loftq_iters=args.loftq_iters, paca_selection=args.paca_selection)
+                                   loftq_iters=args.loftq_iters, paca_selection=args.paca_selection,
+                                   paca_tuner=args.paca_tuner, paca_rank=args.paca_rank,
+                                   paca_adapter_rank=args.paca_adapter_rank)
         ln_params = freeze_non_trainable(model, pruned_block_indices)
-        if args.adapter_type == "paca":
-            print(f"[SFP-MultiFilter] Injected {lora_params:,} PACA parameters "
-                  f"(trainable columns/rank={args.lora_rank}, selection={args.paca_selection}) "
+        if is_paca_family and paca_is_fused:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()}+"
+                  f"{args.paca_tuner.upper()} fused parameters (columns r={paca_cols}, adapter rank "
+                  f"k={args.paca_adapter_rank}, selection={args.paca_selection}) across all blocks "
+                  f"except {pruned_block_indices}.")
+        elif is_paca_family:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
+                  f"(trainable columns/rank={paca_cols}, selection={args.paca_selection}) "
                   f"across all blocks except {pruned_block_indices}.")
         else:
             print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
@@ -1176,6 +1234,14 @@ def main():
 
     for epoch in range(1, effective_epochs + 1):
         model.train()
+        # RPaCA: at the start of each epoch after the first, commit the columns
+        # trained last epoch back into the frozen weights and pick a fresh random
+        # set to train this epoch. Reset the optimizer state for the resampled
+        # params since their meaning changed to new columns.
+        if is_rpaca and epoch > 1:
+            reset_params = resample_all_paca(model)
+            for _p in reset_params:
+                optimizer.state.pop(_p, None)
         running_loss = 0.0
         running_ortho_loss = 0.0
         epoch_samples = 0
@@ -1395,10 +1461,19 @@ def main():
 
     if args.full_finetune:
         resolved_mode = "full_finetune"
+    elif is_paca_family and paca_cols > 0:
+        resolved_mode = f"sft_{args.adapter_type}"          # sft_paca / sft_rpaca
+        if paca_is_fused:
+            resolved_mode += f"_{args.paca_tuner}"          # +_lora / +_dora
+            if ortho_enabled:
+                resolved_mode += "_ortho"
     elif args.lora_rank > 0:
         resolved_mode = "sft_lora_ortho" if ortho_enabled else "sft_lora"
     else:
         resolved_mode = "sft"
+
+    paca_reported = (not args.full_finetune) and is_paca_family and paca_cols > 0
+    adapter_reported = (not args.full_finetune) and (args.lora_rank > 0 or paca_reported)
 
     summary = {
         "dataset": args.dataset,
@@ -1417,8 +1492,11 @@ def main():
         "lora_rank": lora_rank_effective if not args.full_finetune else None,
         "lora_rank_base": lora_rank_base if (not args.full_finetune and args.lora_rank > 0) else None,
         "num_ortho_blocks": args.num_ortho_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
-        "adapter_type": args.adapter_type if (not args.full_finetune and args.lora_rank > 0) else None,
-        "paca_selection": args.paca_selection if (not args.full_finetune and args.lora_rank > 0 and args.adapter_type == "paca") else None,
+        "adapter_type": args.adapter_type if adapter_reported else None,
+        "paca_selection": args.paca_selection if paca_reported else None,
+        "paca_tuner": args.paca_tuner if paca_reported else None,
+        "paca_columns": paca_cols if paca_reported else None,
+        "paca_adapter_rank": args.paca_adapter_rank if (paca_reported and paca_is_fused) else None,
         "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
         "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0
                                            and args.init_method == "loftq") else None,
@@ -1476,10 +1554,15 @@ def main():
         print(f"[SFP] Mode: FULL FINE-TUNE (baseline, no SFP/LoRA)")
     else:
         layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
-        if args.lora_rank > 0 and args.adapter_type == "paca":
-            print(f"[SFP] Mode: SFT+PACA | Block selection: {args.block_selection_method} | "
+        if paca_reported and paca_is_fused:
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()}+{args.paca_tuner.upper()}"
+                  f"{' (orthogonal)' if ortho_enabled else ''} | Block selection: {args.block_selection_method} | "
                   f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
-                  f"trainable columns/rank={args.lora_rank}, selection={args.paca_selection}")
+                  f"columns r={paca_cols}, adapter rank k={args.paca_adapter_rank}, selection={args.paca_selection}")
+        elif paca_reported:
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()} | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"trainable columns/rank={paca_cols}, selection={args.paca_selection}")
         elif args.lora_rank > 0:
             ortho_desc = (f" | Orthogonal reg: lambda1={args.lora_ortho_lambda1}, "
                            f"lambda2={args.lora_ortho_lambda2}") if ortho_enabled else ""

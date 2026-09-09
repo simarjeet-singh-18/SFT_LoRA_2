@@ -292,7 +292,7 @@ def compute_lora_orthogonality_loss(model: nn.Module, lambda1: float = 0.0, lamb
 
     n_layers = 0
     for module in model.modules():
-        if isinstance(module, LoRALinear) and module.rank > 0 and module.apply_ortho:
+        if isinstance(module, (LoRALinear, PaCAAdapterLinear)) and module.rank > 0 and module.apply_ortho:
             terms = module.orthogonality_penalty()
             if terms is None:
                 continue
@@ -781,9 +781,165 @@ class PaCALinear(nn.Module):
         W[:, self.selected_idx] = self.paca_weight
         return F.linear(x, W, self.paca_bias)
 
+    @torch.no_grad()
+    def resample_columns(self):
+        """
+        RPaCA step: commit the currently-trained columns back into the frozen full
+        weight, then pick a fresh RANDOM set of r columns to train next. This makes
+        the weight accumulate all prior epochs' updates while each epoch fine-tunes a
+        different random slice. Returns the list of trainable params whose optimizer
+        state should be reset (their meaning just changed to new columns). Selection
+        here is always random (that is what RPaCA means); the initial --paca-selection
+        strategy only governs the first epoch's columns.
+        """
+        # Commit this epoch's trained columns into the frozen full weight.
+        self.frozen_weight[:, self.selected_idx] = self.paca_weight.data
+        # Pick a fresh random set of columns.
+        new_idx = torch.sort(torch.randperm(self.in_features, device=self.frozen_weight.device)[:self.rank]).values
+        self.selected_idx.copy_(new_idx)
+        # Load the new columns' current values into the trainable parameter.
+        self.paca_weight.data.copy_(self.frozen_weight[:, new_idx])
+        return [self.paca_weight]
+
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
                 f"rank(cols)={self.rank}, selection={self.selection}")
+
+
+class PaCAAdapterLinear(nn.Module):
+    """
+    FUSED method: PaCA/RPaCA column SELECTION combined with a low-rank LoRA/DoRA
+    adapter to TUNE the selected columns, instead of training those columns directly.
+
+    Rationale: direct PaCA trains all out*r entries of the selected r-column
+    sub-weight. Here we instead attach a rank-k adapter that only adapts that
+    sub-weight, cutting trainable params to k*(r+out) [+ out for DoRA's magnitude],
+    which is fewer than out*r whenever k < r*out/(r+out) (i.e. roughly k < r).
+
+    Writing the selected sub-weight as P0 = W[:, idx] (out x r, frozen), the layer is
+        y = W_frozen @ x  +  dP @ x[idx]
+    -- the full frozen projection plus the adapter's correction applied ONLY to the r
+    selected input features. The adapter delta sub-weight dP (out x r) is:
+        lora:  dP = scaling * (B @ A)                              # A:(k,r), B:(out,k)
+        dora:  V  = P0 + scaling*(B@A);  dP = m * V/||V||_row - P0  # m:(out,), row norm
+    B is zero-initialized (and DoRA's m = P0 row norm), so dP = 0 at init and the
+    layer equals the pretrained layer exactly at the start.
+
+    Adapter params are named lora_A / lora_B / lora_magnitude so that
+    freeze_non_trainable, the optimizer's adapter LR group, and the orthogonality
+    regularizer recognize them exactly as for a normal LoRA/DoRA layer. apply_ortho
+    gates the orthogonality penalty per layer (for --num-ortho-blocks). `rank` is the
+    adapter rank k (used by orthogonality_penalty). resample_columns() supports RPaCA.
+    """
+    def __init__(self, base_layer: nn.Linear, paca_rank: int, adapter_rank: int,
+                 adapter_type: str = "dora", alpha: float = 32.0, dropout: float = 0.0,
+                 selection: str = "random", apply_ortho: bool = True):
+        super().__init__()
+        assert adapter_type in ("lora", "dora"), f"fused tuner must be 'lora' or 'dora', got {adapter_type!r}"
+        assert selection in ("random", "weight"), f"selection must be 'random' or 'weight', got {selection!r}"
+        out_f, in_f = base_layer.out_features, base_layer.in_features
+        assert 0 < paca_rank <= in_f, (
+            f"--paca-rank (columns) must satisfy 0 < r <= in_features ({in_f}); got {paca_rank}.")
+        assert 0 < adapter_rank <= min(out_f, paca_rank), (
+            f"--paca-adapter-rank (k) must satisfy 0 < k <= min(out_features, paca_rank) "
+            f"= min({out_f}, {paca_rank}); got {adapter_rank}. The fused adapter only makes sense "
+            f"when its rank is below the number of selected columns.")
+        self.in_features, self.out_features = in_f, out_f
+        self.paca_rank, self.rank = paca_rank, adapter_rank
+        self.adapter_type, self.alpha = adapter_type, alpha
+        self.scaling = alpha / adapter_rank
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        self.selection, self.apply_ortho = selection, apply_ortho
+
+        W = base_layer.weight.detach()
+        dev, dt = W.device, W.dtype
+        idx = self._select(W, selection, paca_rank)
+        self.register_buffer("selected_idx", idx.to(dev))
+        self.register_buffer("frozen_weight", W.clone())
+        if base_layer.bias is not None:
+            self.register_buffer("paca_bias", base_layer.bias.detach().clone())
+        else:
+            self.paca_bias = None
+
+        self.lora_A = nn.Parameter(torch.zeros(adapter_rank, paca_rank, device=dev, dtype=dt))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, adapter_rank, device=dev, dtype=dt))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        if adapter_type == "dora":
+            with torch.no_grad():
+                row_norm = self.frozen_weight[:, idx].norm(p=2, dim=1)  # (out,)
+            self.lora_magnitude = nn.Parameter(row_norm)
+        else:
+            self.lora_magnitude = None
+
+    @staticmethod
+    def _select(W, selection, r):
+        if selection == "weight":
+            idx = torch.argsort(W.norm(p=2, dim=0), descending=True)[:r]
+        else:
+            idx = torch.randperm(W.shape[1], device=W.device)[:r]
+        return torch.sort(idx).values
+
+    def _delta_subweight(self):
+        """Returns (dP, P0): the adapter's change to the selected sub-weight and the frozen sub-weight."""
+        P0 = self.frozen_weight[:, self.selected_idx]              # (out, r)
+        BA = self.lora_B @ self.lora_A                             # (out, r)
+        if self.adapter_type == "lora":
+            return self.scaling * BA, P0
+        V = P0 + self.scaling * BA
+        row_norm = V.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)  # (out, 1)
+        W_eff = self.lora_magnitude.unsqueeze(1) * V / row_norm
+        return W_eff - P0, P0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.frozen_weight, self.paca_bias)     # full frozen projection
+        xs = self.dropout(x[..., self.selected_idx])               # (..., r) selected inputs
+        dP, _ = self._delta_subweight()
+        return base + F.linear(xs, dP)
+
+    def orthogonality_penalty(self):
+        """Same (k x k) A@A.T / B.T@B orthonormality residuals as LoRALinear; see that method."""
+        if self.rank <= 0:
+            return None
+        eye_r = torch.eye(self.rank, device=self.lora_A.device, dtype=self.lora_A.dtype)
+        A_term = (self.lora_A @ self.lora_A.t() - eye_r) / self.rank
+        B_term = (self.lora_B.t() @ self.lora_B - eye_r) / self.rank
+        return A_term, B_term
+
+    @torch.no_grad()
+    def resample_columns(self):
+        """
+        RPaCA step for the fused layer: commit the adapter's current delta into the
+        frozen weight at the present columns, pick a fresh random column set, and
+        reset the adapter to a no-op (B=0, A~Kaiming, DoRA m = new P0 row norm).
+        Returns the params whose optimizer state should be reset.
+        """
+        dP, _ = self._delta_subweight()
+        self.frozen_weight[:, self.selected_idx] += dP
+        new_idx = torch.sort(torch.randperm(self.in_features, device=self.frozen_weight.device)[:self.paca_rank]).values
+        self.selected_idx.copy_(new_idx)
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        if self.adapter_type == "dora":
+            self.lora_magnitude.copy_(self.frozen_weight[:, new_idx].norm(p=2, dim=1))
+        return [p for p in (self.lora_A, self.lora_B, self.lora_magnitude) if p is not None]
+
+    def extra_repr(self) -> str:
+        return (f"in={self.in_features}, out={self.out_features}, cols(r)={self.paca_rank}, "
+                f"adapter={self.adapter_type}, adapter_rank(k)={self.rank}, selection={self.selection}")
+
+
+def resample_all_paca(model: nn.Module) -> list:
+    """
+    RPaCA epoch hook: resample the trainable columns of every PaCALinear /
+    PaCAAdapterLinear in the model. Returns the flat list of parameters whose
+    optimizer state should be cleared (their meaning changed to new columns).
+    """
+    reset = []
+    for m in model.modules():
+        if isinstance(m, (PaCALinear, PaCAAdapterLinear)):
+            reset.extend(m.resample_columns())
+    return reset
 
 
 def inject_paca(
@@ -792,29 +948,50 @@ def inject_paca(
     rank: int = 16,
     selection: str = "random",
     target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    tuner: str = "direct",
+    adapter_rank: int = 0,
+    adapter_type: str = "dora",
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    ortho_block_indices=None,
 ) -> int:
     """
-    PaCA counterpart to inject_lora: replaces each target linear layer with a
-    PaCALinear (only r selected columns trainable) in every block EXCEPT the
-    filter-substituted ones (excluded_block_indices). Returns the total number of
-    trainable PaCA parameters (sum of out_features * r over the wrapped layers).
+    PaCA/RPaCA injection into every block EXCEPT the filter-substituted ones. `rank`
+    is r, the number of selected columns; `selection` is the column-selection strategy
+    (random re-selection each epoch, i.e. RPaCA, is driven by the training loop, not
+    here). Returns total trainable parameters injected.
 
-    Mirrors inject_lora's block/keyword iteration exactly, so PaCA lands on the same
-    layers LoRA/DoRA would. Called by inject_lora when adapter_type="paca".
+    tuner:
+      "direct" (default): PaCALinear -- the r selected columns are trained directly
+        (out*r params/layer). This is the original PaCA/RPaCA.
+      "lora"/"dora": PaCAAdapterLinear -- the fused method, where a rank-`adapter_rank`
+        LoRA/DoRA adapter tunes the selected columns instead (k*(r+out) [+out] params,
+        fewer than out*r). alpha/dropout configure that adapter, and ortho_block_indices
+        restricts the orthogonality penalty to selected blocks (like inject_lora).
     """
     excluded = _normalize_indices(excluded_block_indices)
-    paca_params = 0
+    ortho_set = _normalize_indices(ortho_block_indices) if ortho_block_indices is not None else None
+    total_params = 0
     for idx, block in enumerate(model.blocks):
         if idx in excluded:
             continue
+        block_applies_ortho = True if ortho_set is None else (idx in ortho_set)
         for name, module in list(block.named_modules()):
             if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
                 parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
                 parent = block if parent_name == "" else block.get_submodule(parent_name)
-                paca_layer = PaCALinear(module, rank=rank, selection=selection)
-                setattr(parent, attr_name, paca_layer)
-                paca_params += module.out_features * rank
-    return paca_params
+                if tuner == "direct":
+                    layer = PaCALinear(module, rank=rank, selection=selection)
+                    total_params += module.out_features * rank
+                else:
+                    layer = PaCAAdapterLinear(module, paca_rank=rank, adapter_rank=adapter_rank,
+                                               adapter_type=tuner, alpha=alpha, dropout=dropout,
+                                               selection=selection, apply_ortho=block_applies_ortho)
+                    total_params += adapter_rank * (rank + module.out_features)
+                    if tuner == "dora":
+                        total_params += module.out_features  # magnitude vector
+                setattr(parent, attr_name, layer)
+    return total_params
 
 
 def inject_lora(
@@ -830,6 +1007,9 @@ def inject_lora(
     loftq_bits: int = 4,
     loftq_iters: int = 5,
     paca_selection: str = "random",
+    paca_tuner: str = "direct",
+    paca_rank: int = 0,
+    paca_adapter_rank: int = 0,
 ) -> int:
     """
     Wraps target linear layers with LoRALinear in every block EXCEPT those in
@@ -853,15 +1033,23 @@ def inject_lora(
     adapter_type / init_method / loftq_bits / loftq_iters: see LoRALinear's
     docstring. Applied identically to every injected layer.
 
-    adapter_type="paca": delegates to inject_paca -- PaCA trains r selected columns
-    of the pretrained weights instead of adding an adapter, so the LoRA-specific
-    arguments (alpha, dropout, ortho_block_indices, init_method, loftq_*) do not
-    apply and are ignored; lora_rank is reused as PaCA's column count r and
-    paca_selection chooses the column-selection strategy.
+    adapter_type in ("paca", "rpaca"): delegates to inject_paca. paca_rank (falling
+    back to lora_rank if unset) is the number of selected columns r; paca_selection
+    is the column strategy; paca_tuner selects direct training vs a fused LoRA/DoRA
+    adapter of rank paca_adapter_rank. For the fused tuner, lora_alpha/lora_dropout
+    configure the adapter and ortho_block_indices restricts its orthogonality penalty;
+    for the direct tuner, the LoRA-specific arguments do not apply. RPaCA vs PaCA (per-
+    epoch column re-selection) is driven by the training loop, not this function.
     """
-    if adapter_type == "paca":
-        return inject_paca(model, excluded_block_indices, rank=lora_rank,
-                           selection=paca_selection, target_keywords=target_keywords)
+    if adapter_type in ("paca", "rpaca"):
+        cols = paca_rank if paca_rank > 0 else lora_rank
+        fused = paca_tuner in ("lora", "dora")
+        return inject_paca(model, excluded_block_indices, rank=cols, selection=paca_selection,
+                           target_keywords=target_keywords, tuner=paca_tuner,
+                           adapter_rank=paca_adapter_rank,
+                           adapter_type=(paca_tuner if fused else "dora"),
+                           alpha=lora_alpha, dropout=lora_dropout,
+                           ortho_block_indices=ortho_block_indices)
 
     excluded = _normalize_indices(excluded_block_indices)
     ortho_blocks = None if ortho_block_indices is None else _normalize_indices(ortho_block_indices)
@@ -935,6 +1123,9 @@ def apply_single_filter_and_lora(
     loftq_bits: int = 4,
     loftq_iters: int = 5,
     paca_selection: str = "random",
+    paca_tuner: str = "direct",
+    paca_rank: int = 0,
+    paca_adapter_rank: int = 0,
 ):
     """
     Backward-compatible convenience wrapper for the SINGLE-block case, built on top
@@ -969,15 +1160,22 @@ def apply_single_filter_and_lora(
     lora_params = inject_lora(model, pruned_block_idx, lora_rank, lora_alpha, lora_dropout, target_keywords,
                                ortho_block_indices=ortho_block_indices, adapter_type=adapter_type,
                                init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters,
-                               paca_selection=paca_selection)
+                               paca_selection=paca_selection, paca_tuner=paca_tuner,
+                               paca_rank=paca_rank, paca_adapter_rank=paca_adapter_rank)
     ln_params = freeze_non_trainable(model, pruned_block_idx)
 
     layer_desc = "Single" if filter_num_layers <= 1 else f"{filter_num_layers}-Layer"
     residual_desc = f" + residual(hidden={filter_residual_hidden_dim})" if filter_residual_hidden_dim > 0 else ""
     print(f"[SFP-SingleFilter] Substituted block {pruned_block_idx} with {layer_desc} Filter Block{residual_desc}.")
-    if adapter_type == "paca":
-        print(f"[SFP-SingleFilter] Injected {lora_params:,} PACA parameters "
-              f"(trainable columns/rank={lora_rank}, selection={paca_selection}).")
+    if adapter_type in ("paca", "rpaca"):
+        cols = paca_rank if paca_rank > 0 else lora_rank
+        if paca_tuner in ("lora", "dora"):
+            print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()}+{paca_tuner.upper()} "
+                  f"fused parameters (columns r={cols}, adapter rank k={paca_adapter_rank}, "
+                  f"selection={paca_selection}).")
+        else:
+            print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
+                  f"(trainable columns/rank={cols}, selection={paca_selection}).")
     else:
         print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
               f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, init={init_method}).")
