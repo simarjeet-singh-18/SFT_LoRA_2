@@ -238,15 +238,35 @@ def _method_order_key(m):
     return (PREFERRED_METHOD_ORDER.index(m), "") if m in PREFERRED_METHOD_ORDER else (len(PREFERRED_METHOD_ORDER), m)
 
 
-def best_block_per_method(rows, time_field="train_compute_s"):
+TIME_METRICS = {
+    # choice -> (per-row value function, axis label, "higher is faster?")
+    "compute":    (lambda r: r["train_compute_s"],                     "train compute (s)",        False),
+    "wall":       (lambda r: r["train_wall_s"],                        "train wall (s)",           False),
+    "per_epoch":  (lambda r: (r["train_compute_s"] / r["epochs_trained"]
+                              if r.get("train_compute_s") and r.get("epochs_trained") else None),
+                   "compute per epoch (s/epoch)", False),
+    "throughput": (lambda r: r["throughput_sps"],                      "throughput (samples/s)",   True),
+}
+
+
+def best_block_per_method(rows, metric="compute"):
     """
     For each (dataset, method), pick the block with the highest test accuracy
     (averaging over seeds first when there are several), and return that block's
-    accuracy, id, training time and trainable-param %.
+    accuracy, id, secondary time/speed metric and trainable-param %.
+
+    `metric` selects the secondary curve (see TIME_METRICS):
+      compute    - total train-loop seconds (noisy: scales with early-stopped epochs)
+      wall       - total wall-clock seconds
+      per_epoch  - seconds per epoch = compute / epochs_trained (removes the epoch-count
+                   noise; ~2% stable within a method)
+      throughput - samples/sec (hardware-fair speed; higher = faster; ~2% stable)
 
     Returns: { dataset: [ {method, block, test_acc, time_s, trainable_pct, n_seeds}, ... ] }
-    with the per-dataset list ordered by PREFERRED_METHOD_ORDER.
+    ordered by PREFERRED_METHOD_ORDER. The secondary value is stored under "time_s"
+    regardless of which metric was chosen.
     """
+    value_fn = TIME_METRICS[metric][0]
     by_dmb = defaultdict(list)  # (dataset, method, block) -> runs (one per seed)
     for r in rows:
         if r["test_acc"] is None or r["block"] is None:
@@ -257,7 +277,7 @@ def best_block_per_method(rows, time_field="train_compute_s"):
     for (ds, method, block), rs in by_dmb.items():
         per_block[(ds, method, block)] = {
             "test_acc": _mean([r["test_acc"] for r in rs]),
-            "time_s": _mean([r[time_field] for r in rs]),
+            "time_s": _mean([value_fn(r) for r in rs]),
             "trainable_pct": _mean([r["trainable_pct"] for r in rs]),
             "n_seeds": len({r["seed"] for r in rs}),
         }
@@ -332,7 +352,7 @@ def plot_dataset(dataset, records, out_path, time_field_label="train compute (s)
     ax_time.set_ylabel(time_field_label, color=TIME_COLOR)
     ax_time.tick_params(axis="y", labelcolor=TIME_COLOR)
     ax_acc.set_xlabel("method  (trainable-param % in parentheses)")
-    ax_acc.set_title(f"{dataset}: best accuracy vs training time per method")
+    ax_acc.set_title(f"{dataset}: best accuracy vs {time_field_label} per method")
     ax_acc.grid(True, axis="y", linestyle=":", alpha=0.4)
 
     lines = ax_acc.get_lines() + ax_time.get_lines()
@@ -348,7 +368,7 @@ def plot_dataset(dataset, records, out_path, time_field_label="train compute (s)
 
 def main():
     ap = argparse.ArgumentParser(description="Summarize SFP sweep results.")
-    ap.add_argument("--root", default="/export/home/achyut/Simarjeet/SFT_LoRA_2/logs2", help="Results tree to scan (default: logs2)")
+    ap.add_argument("--root", default="logs2", help="Results tree to scan (default: logs2)")
     ap.add_argument("--out-dir", default=None, help="Where to write CSVs (default: --root)")
     ap.add_argument("--datasets", default=None, help="Comma-separated filter, e.g. cifar100,svhn")
     ap.add_argument("--seeds", default=None, help="Comma-separated seed filter, e.g. 18,42")
@@ -359,9 +379,12 @@ def main():
                     help="Column to sort the per-run CSV by (default: test_acc)")
     ap.add_argument("--no-plots", action="store_true",
                     help="Skip the per-dataset accuracy-vs-time plots.")
-    ap.add_argument("--plot-time", default="compute", choices=["compute", "wall"],
-                    help="Which training-time to draw on the plots: 'compute' (pure "
-                         "train-loop seconds, default) or 'wall' (train wall-clock seconds).")
+    ap.add_argument("--plot-time", default="throughput",
+                    choices=["compute", "wall", "per_epoch", "throughput"],
+                    help="Which speed/cost metric to draw as the second curve on the per-dataset "
+                         "plots. 'throughput' (samples/s, default) and 'per_epoch' (compute/epoch) are "
+                         "hardware-fair and ~2%% stable; 'compute'/'wall' are total training seconds, "
+                         "which are noisy because early stopping ends runs at very different epoch counts.")
     args = ap.parse_args()
 
     out_dir = args.out_dir or args.root
@@ -474,9 +497,8 @@ def main():
 
     # ---- per-dataset accuracy-vs-time plots ----
     if not args.no_plots:
-        time_field = "train_wall_s" if args.plot_time == "wall" else "train_compute_s"
-        time_label = "train wall (s)" if args.plot_time == "wall" else "train compute (s)"
-        best = best_block_per_method(rows, time_field=time_field)
+        _, time_label, _ = TIME_METRICS[args.plot_time]
+        best = best_block_per_method(rows, metric=args.plot_time)
         plots_dir = os.path.join(out_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
         written = []
