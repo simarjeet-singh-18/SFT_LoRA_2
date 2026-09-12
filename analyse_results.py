@@ -368,7 +368,7 @@ def plot_dataset(dataset, records, out_path, time_field_label="train compute (s)
 
 def main():
     ap = argparse.ArgumentParser(description="Summarize SFP sweep results.")
-    ap.add_argument("--root", default="logs2", help="Results tree to scan (default: logs2)")
+    ap.add_argument("--root", default="/export/home/achyut/Simarjeet/SFT_LoRA_2/logs2", help="Results tree to scan (default: logs2)")
     ap.add_argument("--out-dir", default=None, help="Where to write CSVs (default: --root)")
     ap.add_argument("--datasets", default=None, help="Comma-separated filter, e.g. cifar100,svhn")
     ap.add_argument("--seeds", default=None, help="Comma-separated seed filter, e.g. 18,42")

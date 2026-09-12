@@ -942,6 +942,210 @@ def resample_all_paca(model: nn.Module) -> list:
     return reset
 
 
+class UniLoRABank(nn.Module):
+    """
+    Holder for Uni-LoRA's single GLOBAL trainable vector theta_d (arXiv 2506.00799).
+    Every Uni adapter layer in the model shares this one vector; the layers only own
+    (frozen) index/normalization buffers that gather their A/B entries out of it. It is
+    attached to the model as `model.unilora_bank`, so its parameter is discovered by
+    model.parameters()/named_parameters() exactly once. The name "unilora_bank.theta_d"
+    contains the "lora_" substring, so freeze_non_trainable unfreezes it and the
+    optimizer's adapter LR group picks it up, with no changes to that machinery.
+    """
+    def __init__(self, d: int, device=None, dtype=None, seed: int = 0):
+        super().__init__()
+        self.theta_d = nn.Parameter(torch.empty(d, device=device, dtype=dtype))
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        # Paper's init: theta_d ~ U(-0.02, 0.02). theta_d MUST be nonzero at init:
+        # if it were 0, both A and B would be 0 and grad(BA) w.r.t. theta_d would
+        # vanish (a saddle), so the vector could never move. Small uniform noise
+        # keeps the initial adapter delta negligible while allowing gradients.
+        with torch.no_grad():
+            self.theta_d.copy_(torch.empty(d).uniform_(-0.02, 0.02, generator=g))
+        # Bookkeeping for reporting (filled in by inject_unilora).
+        self.subspace_dim = d
+        self.full_lora_dim = None
+
+
+class UniLoRAAdapterLinear(nn.Module):
+    """
+    Uni-LoRA / Uni-DoRA adapter (arXiv 2506.00799, "One Vector is All You Need").
+
+    Standard LoRA gives each layer its own trainable A (r x in) and B (out x r).
+    Uni-LoRA instead reconstructs every layer's A and B by gathering entries from ONE
+    globally shared trainable vector theta_d (held in UniLoRABank) through a frozen,
+    random projection: each A/B entry is assigned a uniformly-random index into
+    theta_d, and multiplied by a fixed normalization 1/sqrt(n_k) where n_k is how many
+    times index k is used across ALL layers (global). That normalization makes the
+    implied projection matrix P (theta_D = P theta_d) isometric. Only theta_d trains;
+    the indices and norms are frozen buffers. This is "unilora".
+
+    "unidora" additionally applies DoRA's magnitude/direction split on top of the
+    Uni-reconstructed low-rank update: the direction is W0 + scaling*(B^T A^T) and a
+    per-layer trainable magnitude vector `lora_magnitude` (one entry per output neuron)
+    rescales each row -- exactly the row-norm DoRA convention used by LoRALinear here.
+
+    Following the paper's Algorithm 1, A has shape (in, r) and B has shape (r, out),
+    and the low-rank update is applied as (x @ A) @ B, i.e. the added weight (in
+    out-by-in form) is scaling * (A @ B)^T. Unlike plain LoRA, the update is NOT exactly
+    zero at init (theta_d is small but nonzero), but the perturbation is tiny.
+    """
+    def __init__(self, base_layer: nn.Linear, theta_param: nn.Parameter, d: int,
+                 rank: int, adapter_type: str = "unilora", alpha: float = 32.0,
+                 dropout: float = 0.0, scale_by_alpha: bool = False,
+                 generator: torch.Generator = None):
+        super().__init__()
+        assert adapter_type in ("unilora", "unidora")
+        assert rank > 0, "Uni-LoRA requires --lora-rank > 0 (the low-rank r)."
+        self.base_layer = base_layer
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        self.adapter_type = adapter_type
+        self.rank = rank
+        self.d = d
+        self.alpha = alpha
+        # The paper's Algorithm 1 uses no alpha scaling; keep scaling=1 by default so
+        # theta_d's U(-0.02,0.02) init behaves as intended. scale_by_alpha=True opts
+        # into the usual alpha/r LoRA scaling if desired.
+        self.scaling = (alpha / rank) if scale_by_alpha else 1.0
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        # NOT registered as a parameter of THIS module (stored inside a tuple so
+        # nn.Module.__setattr__ doesn't re-register it) -- theta_d lives once in the
+        # bank; here we only keep a reference so gradients flow back to that one vector.
+        self._theta_ref = (theta_param,)
+
+        in_f, out_f = base_layer.in_features, base_layer.out_features
+        dev = base_layer.weight.device
+        # Frozen random projection indices into theta_d. A:(in,r), B:(r,out) per Alg. 1.
+        idx_A = torch.randint(0, d, (in_f, rank), generator=generator).to(dev)
+        idx_B = torch.randint(0, d, (rank, out_f), generator=generator).to(dev)
+        self.register_buffer("index_A", idx_A)
+        self.register_buffer("index_B", idx_B)
+        # Normalization buffers; real values are filled in globally by inject_unilora
+        # (they depend on index-occurrence counts across ALL layers). Placeholder ones
+        # are never used for a forward before that assignment happens.
+        self.register_buffer("norm_A", torch.ones(in_f, rank, device=dev))
+        self.register_buffer("norm_B", torch.ones(rank, out_f, device=dev))
+
+        if adapter_type == "unidora":
+            with torch.no_grad():
+                row_norm = base_layer.weight.norm(p=2, dim=1)  # (out,)
+            self.lora_magnitude = nn.Parameter(row_norm)
+        else:
+            self.lora_magnitude = None
+
+    def _reconstruct_AB(self):
+        theta = self._theta_ref[0]
+        A = theta[self.index_A] * self.norm_A   # (in, r)
+        B = theta[self.index_B] * self.norm_B   # (r, out)
+        return A, B
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        A, B = self._reconstruct_AB()
+        if self.adapter_type == "unilora":
+            base = self.base_layer(x)
+            delta = torch.matmul(torch.matmul(self.dropout(x), A), B)  # (..., out)
+            return base + self.scaling * delta
+        # unidora: DoRA magnitude/direction on the Uni-reconstructed update.
+        W0 = self.base_layer.weight                      # (out, in)
+        W_delta = self.scaling * torch.matmul(A, B).t()  # (out, in) = scaling*(A@B)^T
+        V = W0 + W_delta
+        row_norm = V.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)  # (out,1)
+        W_eff = self.lora_magnitude.unsqueeze(1) * V / row_norm
+        return F.linear(x, W_eff, self.base_layer.bias)
+
+    def extra_repr(self) -> str:
+        return (f"in={self.base_layer.in_features}, out={self.base_layer.out_features}, "
+                f"rank={self.rank}, d={self.d}, type={self.adapter_type}")
+
+
+def inject_unilora(
+    model: nn.Module,
+    excluded_block_indices,
+    d: int,
+    rank: int = 4,
+    adapter_type: str = "unilora",
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    seed: int = 0,
+    scale_by_alpha: bool = False,
+) -> int:
+    """
+    Inject Uni-LoRA/Uni-DoRA into every block EXCEPT the filter-substituted ones,
+    hitting the same target linear layers as inject_lora. All injected layers SHARE a
+    single global trainable vector theta_d of length d (held in model.unilora_bank).
+
+    Two passes: (1) build every adapter layer with random projection indices into
+    theta_d; (2) compute the global per-index occurrence counts n_k over all layers'
+    indices and set each layer's 1/sqrt(n_k) normalization (isometric projection).
+
+    Returns the number of trainable adapter parameters: d (theta_d), plus the DoRA
+    magnitude vectors (out_features per layer) when adapter_type="unidora".
+    """
+    assert adapter_type in ("unilora", "unidora")
+    assert d and d > 0, "Uni-LoRA subspace dim d must be positive."
+    excluded = _normalize_indices(excluded_block_indices)
+    ref_device = next(model.parameters()).device
+    ref_dtype = next(model.parameters()).dtype
+
+    # Pre-scan the target linear layers (same block/keyword rule as inject_lora) so we
+    # know D = full LoRA parameter count before allocating the subspace vector.
+    targets = []  # (parent_module, attr_name, module)
+    full_lora_dim = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        for name, module in list(block.named_modules()):
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = block if parent_name == "" else block.get_submodule(parent_name)
+                targets.append((parent, attr_name, module))
+                full_lora_dim += rank * (module.in_features + module.out_features)
+
+    # Uni-LoRA requires d << D. Clamp (with a warning) if the requested subspace is not
+    # smaller than the full LoRA space -- otherwise slots would go unused / it degenerates.
+    if d >= full_lora_dim:
+        print(f"[Uni-LoRA] WARNING: requested subspace d={d} >= full LoRA dim D={full_lora_dim}; "
+              f"clamping d to {full_lora_dim}. Uni-LoRA is designed for d << D -- consider a smaller "
+              f"--unilora-dim.")
+        d = full_lora_dim
+
+    # Global shared vector.
+    bank = UniLoRABank(d, device=ref_device, dtype=ref_dtype, seed=seed)
+    model.unilora_bank = bank  # registers the one theta_d parameter on the model
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)  # for projection indices
+
+    # Pass 1: create layers, all sharing bank.theta_d.
+    uni_layers = []
+    for parent, attr_name, module in targets:
+        layer = UniLoRAAdapterLinear(module, bank.theta_d, d, rank,
+                                     adapter_type=adapter_type, alpha=alpha,
+                                     dropout=dropout, scale_by_alpha=scale_by_alpha,
+                                     generator=gen)
+        setattr(parent, attr_name, layer)
+        uni_layers.append(layer)
+
+    # Pass 2: global 1/sqrt(n_k) normalization (isometry).
+    counts = torch.zeros(d, dtype=torch.long, device=ref_device)
+    for layer in uni_layers:
+        counts += torch.bincount(layer.index_A.flatten(), minlength=d)
+        counts += torch.bincount(layer.index_B.flatten(), minlength=d)
+    inv_sqrt = counts.clamp(min=1).to(torch.float32).rsqrt()  # unused indices clamp to 1 (never gathered)
+    empty = int((counts == 0).sum().item())
+    for layer in uni_layers:
+        with torch.no_grad():
+            layer.norm_A.copy_(inv_sqrt[layer.index_A].to(layer.norm_A.dtype))
+            layer.norm_B.copy_(inv_sqrt[layer.index_B].to(layer.norm_B.dtype))
+
+    bank.full_lora_dim = full_lora_dim
+    bank.num_empty_slots = empty
+    magnitude_params = sum(l.lora_magnitude.numel() for l in uni_layers) if adapter_type == "unidora" else 0
+    return d + magnitude_params
+
+
 def inject_paca(
     model: nn.Module,
     excluded_block_indices,
@@ -1010,6 +1214,8 @@ def inject_lora(
     paca_tuner: str = "direct",
     paca_rank: int = 0,
     paca_adapter_rank: int = 0,
+    unilora_dim: int = 0,
+    unilora_seed: int = 0,
 ) -> int:
     """
     Wraps target linear layers with LoRALinear in every block EXCEPT those in
@@ -1050,6 +1256,11 @@ def inject_lora(
                            adapter_type=(paca_tuner if fused else "dora"),
                            alpha=lora_alpha, dropout=lora_dropout,
                            ortho_block_indices=ortho_block_indices)
+
+    if adapter_type in ("unilora", "unidora"):
+        return inject_unilora(model, excluded_block_indices, d=unilora_dim, rank=lora_rank,
+                              adapter_type=adapter_type, alpha=lora_alpha, dropout=lora_dropout,
+                              target_keywords=target_keywords, seed=unilora_seed)
 
     excluded = _normalize_indices(excluded_block_indices)
     ortho_blocks = None if ortho_block_indices is None else _normalize_indices(ortho_block_indices)
@@ -1126,6 +1337,8 @@ def apply_single_filter_and_lora(
     paca_tuner: str = "direct",
     paca_rank: int = 0,
     paca_adapter_rank: int = 0,
+    unilora_dim: int = 0,
+    unilora_seed: int = 0,
 ):
     """
     Backward-compatible convenience wrapper for the SINGLE-block case, built on top
@@ -1161,13 +1374,20 @@ def apply_single_filter_and_lora(
                                ortho_block_indices=ortho_block_indices, adapter_type=adapter_type,
                                init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters,
                                paca_selection=paca_selection, paca_tuner=paca_tuner,
-                               paca_rank=paca_rank, paca_adapter_rank=paca_adapter_rank)
+                               paca_rank=paca_rank, paca_adapter_rank=paca_adapter_rank,
+                               unilora_dim=unilora_dim, unilora_seed=unilora_seed)
     ln_params = freeze_non_trainable(model, pruned_block_idx)
 
     layer_desc = "Single" if filter_num_layers <= 1 else f"{filter_num_layers}-Layer"
     residual_desc = f" + residual(hidden={filter_residual_hidden_dim})" if filter_residual_hidden_dim > 0 else ""
     print(f"[SFP-SingleFilter] Substituted block {pruned_block_idx} with {layer_desc} Filter Block{residual_desc}.")
-    if adapter_type in ("paca", "rpaca"):
+    if adapter_type in ("unilora", "unidora"):
+        bank = getattr(model, "unilora_bank", None)
+        D = bank.full_lora_dim if bank is not None else None
+        print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} trainable parameters "
+              f"(rank={lora_rank}, shared subspace d={unilora_dim}"
+              + (f", full LoRA dim D={D:,}" if D else "") + ").")
+    elif adapter_type in ("paca", "rpaca"):
         cols = paca_rank if paca_rank > 0 else lora_rank
         if paca_tuner in ("lora", "dora"):
             print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()}+{paca_tuner.upper()} "

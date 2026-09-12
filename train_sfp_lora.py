@@ -513,7 +513,8 @@ def main():
                               "are all ignored when this is set. Equivalent to --mode full_finetune.")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
-    parser.add_argument("--adapter-type", type=str, default="lora", choices=["lora", "dora", "paca", "rpaca"],
+    parser.add_argument("--adapter-type", type=str, default="lora",
+                         choices=["lora", "dora", "paca", "rpaca", "unilora", "unidora"],
                          help="'lora' (default): standard low-rank adapter, W' = W_base + scaling*(B@A), "
                               "unchanged from all previous versions of this script. "
                               "'dora' (Weight-Decomposed Low-Rank Adaptation): decomposes each adapted "
@@ -565,6 +566,14 @@ def main():
                               "(only used when --paca-tuner is lora or dora). Must satisfy 0 < k <= r "
                               "(fewer than the number of selected columns) for the fusion to reduce params. "
                               "Required when --paca-tuner != direct.")
+    parser.add_argument("--unilora-dim", type=int, default=72000,
+                         help="Uni-LoRA/Uni-DoRA subspace dimension d (arXiv 2506.00799): the length of the "
+                              "SINGLE global trainable vector that ALL adapter layers share via a frozen, "
+                              "isometric random projection. Only d parameters are trained for the whole "
+                              "backbone (plus per-layer magnitude vectors for unidora). Must be << the full "
+                              "LoRA parameter count D (auto-clamped to D with a warning otherwise). The paper "
+                              "uses d=72000 for ViT-Base (default here). --lora-rank sets the underlying LoRA "
+                              "rank r. Ignored unless --adapter-type is unilora or unidora.")
     parser.add_argument("--init-method", type=str, default="default", choices=["default", "loftq"],
                          help="'default' (unchanged): lora_A ~ Kaiming-uniform, lora_B = 0, base layer "
                               "weight kept at full precision. "
@@ -834,6 +843,25 @@ def main():
         if args.paca_rank > 0 or args.paca_adapter_rank > 0:
             parser.error("--paca-rank / --paca-adapter-rank only apply to --adapter-type paca/rpaca.")
 
+    # --adapter-type unilora/unidora reconstruct all layers' LoRA A/B from ONE shared
+    # trainable vector via a frozen isometric random projection (arXiv 2506.00799).
+    # The LoRA-specific fitting/regularization knobs don't apply to that shared vector.
+    if args.adapter_type in ("unilora", "unidora"):
+        if args.lora_rank <= 0:
+            parser.error(f"--adapter-type {args.adapter_type} needs --lora-rank > 0 (the underlying LoRA "
+                          "rank r; the paper uses 4).")
+        if args.unilora_dim <= 0:
+            parser.error("--unilora-dim (the shared subspace size d) must be > 0.")
+        if args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0 or args.num_ortho_blocks > 0:
+            parser.error(f"--adapter-type {args.adapter_type} reconstructs A/B from a shared vector via a "
+                          "fixed projection, so there are no free A/B matrices to orthogonalize. Drop the "
+                          "orthogonality flags.")
+        if args.init_method == "loftq":
+            parser.error(f"--init-method loftq doesn't apply to --adapter-type {args.adapter_type}. "
+                          "Use --init-method default.")
+        if args.compensate_params:
+            parser.error(f"--compensate-params doesn't apply to --adapter-type {args.adapter_type}.")
+
     # --mode is a thin, explicit selector over the three configurations the rest of
     # this script already supports individually (--full-finetune, plain SNIP+filter-
     # block SFT with LoRA off, and SNIP+filter-block SFT with LoRA + orthogonality
@@ -885,8 +913,11 @@ def main():
     is_rpaca = args.adapter_type == "rpaca"
     paca_is_fused = is_paca_family and args.paca_tuner in ("lora", "dora")
     paca_cols = (args.paca_rank if args.paca_rank > 0 else args.lora_rank) if is_paca_family else 0
+    # Uni-LoRA/Uni-DoRA helper (shared-subspace adapters):
+    is_uni_family = args.adapter_type in ("unilora", "unidora")
     # Whether the run has A/B adapter matrices the orthogonality penalty can act on
-    # (standalone LoRA/DoRA, or a fused PaCA/RPaCA tuner).
+    # (standalone LoRA/DoRA, or a fused PaCA/RPaCA tuner). Uni's A/B are reconstructed
+    # from a shared vector via a fixed projection, so they are NOT free to orthogonalize.
     has_ab_adapter = (args.adapter_type in ("lora", "dora") and args.lora_rank > 0) or paca_is_fused
 
     # The --lr default (1e-3) was tuned for SFP's tiny filter block + LN + head
@@ -1036,6 +1067,8 @@ def main():
             paca_tuner=args.paca_tuner,
             paca_rank=args.paca_rank,
             paca_adapter_rank=args.paca_adapter_rank,
+            unilora_dim=args.unilora_dim,
+            unilora_seed=args.seed,
         )
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
         filter_blocks = [filter_block]
@@ -1131,9 +1164,17 @@ def main():
                                    init_method=args.init_method, loftq_bits=args.loftq_bits,
                                    loftq_iters=args.loftq_iters, paca_selection=args.paca_selection,
                                    paca_tuner=args.paca_tuner, paca_rank=args.paca_rank,
-                                   paca_adapter_rank=args.paca_adapter_rank)
+                                   paca_adapter_rank=args.paca_adapter_rank,
+                                   unilora_dim=args.unilora_dim, unilora_seed=args.seed)
         ln_params = freeze_non_trainable(model, pruned_block_indices)
-        if is_paca_family and paca_is_fused:
+        if is_uni_family:
+            bank = getattr(model, "unilora_bank", None)
+            D = bank.full_lora_dim if bank is not None else None
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} trainable "
+                  f"parameters (rank={args.lora_rank}, shared subspace d={args.unilora_dim}"
+                  + (f", full LoRA dim D={D:,}" if D else "")
+                  + f") across all blocks except {pruned_block_indices}.")
+        elif is_paca_family and paca_is_fused:
             print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()}+"
                   f"{args.paca_tuner.upper()} fused parameters (columns r={paca_cols}, adapter rank "
                   f"k={args.paca_adapter_rank}, selection={args.paca_selection}) across all blocks "
@@ -1468,12 +1509,15 @@ def main():
             resolved_mode += f"_{args.paca_tuner}"          # +_lora / +_dora
             if ortho_enabled:
                 resolved_mode += "_ortho"
+    elif is_uni_family:
+        resolved_mode = f"sft_{args.adapter_type}"          # sft_unilora / sft_unidora
     elif args.lora_rank > 0:
         resolved_mode = "sft_lora_ortho" if ortho_enabled else "sft_lora"
     else:
         resolved_mode = "sft"
 
     paca_reported = (not args.full_finetune) and is_paca_family and paca_cols > 0
+    uni_reported = (not args.full_finetune) and is_uni_family
     adapter_reported = (not args.full_finetune) and (args.lora_rank > 0 or paca_reported)
 
     summary = {
@@ -1498,6 +1542,8 @@ def main():
         "paca_tuner": args.paca_tuner if paca_reported else None,
         "paca_columns": paca_cols if paca_reported else None,
         "paca_adapter_rank": args.paca_adapter_rank if (paca_reported and paca_is_fused) else None,
+        "unilora_dim": (getattr(model, "unilora_bank").subspace_dim if uni_reported and hasattr(model, "unilora_bank") else None),
+        "unilora_full_lora_dim": (getattr(model, "unilora_bank").full_lora_dim if uni_reported and hasattr(model, "unilora_bank") else None),
         "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
         "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0
                                            and args.init_method == "loftq") else None,
@@ -1566,6 +1612,13 @@ def main():
             print(f"[SFP] Mode: SFT+{args.adapter_type.upper()} | Block selection: {args.block_selection_method} | "
                   f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
                   f"trainable columns/rank={paca_cols}, selection={args.paca_selection}")
+        elif uni_reported:
+            _bank = getattr(model, "unilora_bank", None)
+            _D = _bank.full_lora_dim if _bank is not None else None
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()} | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"rank={args.lora_rank}, shared subspace d={args.unilora_dim}"
+                  + (f" (full LoRA dim D={_D:,})" if _D else ""))
         elif args.lora_rank > 0:
             ortho_desc = (f" | Orthogonal reg: lambda1={args.lora_ortho_lambda1}, "
                            f"lambda2={args.lora_ortho_lambda2}") if ortho_enabled else ""
