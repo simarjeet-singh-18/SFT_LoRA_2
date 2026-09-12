@@ -442,6 +442,7 @@ def main():
     parser = argparse.ArgumentParser(description="SFP Single Filter + LoRA Fine-Tuning")
     parser.add_argument("--dataset", type=str, default="pets",
                          choices=["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100",
+                                  "fgvc_aircraft", "eurosat", "sun397",
                                   "pcam", "clevr", "dsprites-loc", "dsprites-ori"])
     parser.add_argument("--num-samples", type=int, default=1000)
     parser.add_argument("--use-full-dataset", action="store_true")
@@ -716,9 +717,9 @@ def main():
                               "mode). Also used as the cosine LR schedule's horizon in that mode, "
                               "since the actual stopping epoch isn't known in advance. Ignored "
                               "when --epochs is set to a positive value.")
-    parser.add_argument("--warmup-epochs", type=int, default=2,
+    parser.add_argument("--warmup-epochs", type=int, default=0,
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.01,
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0,
                          help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
     parser.add_argument("--grad-clip", type=float, default=0.0,
                          help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
@@ -1510,6 +1511,8 @@ def main():
         "block_selection_comparison_available": block_selection_comparison is not None,
         "lora_alpha": args.lora_alpha if not args.full_finetune else None,
         "lora_dropout": args.lora_dropout if not args.full_finetune else None,
+        "lora_ortho_lambda1": args.lora_ortho_lambda1 if ortho_enabled else None,
+        "lora_ortho_lambda2": args.lora_ortho_lambda2 if ortho_enabled else None,
         "seed": args.seed,
         "deterministic": not args.fast,
         "lr_main": args.lr,

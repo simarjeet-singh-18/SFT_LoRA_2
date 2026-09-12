@@ -215,6 +215,33 @@ def get_dataset_by_name(name: str, root: str, train: bool, transform, seed: int 
         return train_set if train else test_set
     elif name == "cifar100":
         return datasets.CIFAR100(root=root, train=train, download=True, transform=transform)
+    elif name in ("aircraft", "fgvc_aircraft", "fgvcaircraft"):
+        # FGVC-Aircraft, 100 variant classes. Has a native split kwarg (like pets):
+        # use 'trainval' for training/val and 'test' for testing.
+        split = "trainval" if train else "test"
+        return datasets.FGVCAircraft(root=root, split=split, annotation_level="variant",
+                                      download=True, transform=transform)
+    elif name == "eurosat":
+        # EuroSAT, 10 land-use classes. No native split kwarg, so split 80/20 manually
+        # with a FIXED seed -- identical to the caltech101 pattern above, so the train=True
+        # and train=False calls return complementary, reproducible partitions.
+        dataset = datasets.EuroSAT(root=root, download=True, transform=transform)
+        train_len = int(0.8 * len(dataset))
+        test_len = len(dataset) - train_len
+        train_set, test_set = random_split(
+            dataset, [train_len, test_len], generator=torch.Generator().manual_seed(seed)
+        )
+        return train_set if train else test_set
+    elif name == "sun397":
+        # SUN397, 397 scene classes. No native split kwarg -> manual 80/20 split (same
+        # fixed-seed pattern as caltech101/eurosat).
+        dataset = datasets.SUN397(root=root, download=True, transform=transform)
+        train_len = int(0.8 * len(dataset))
+        test_len = len(dataset) - train_len
+        train_set, test_set = random_split(
+            dataset, [train_len, test_len], generator=torch.Generator().manual_seed(seed)
+        )
+        return train_set if train else test_set
     elif name == "pcam":
         # VTAB "Specialized" domain: histopathology patches, binary tumor/no-tumor.
         split = "train" if train else "test"
@@ -312,6 +339,12 @@ def get_dataloaders(args):
         num_classes = 10
     elif dataset_name in ["flowers", "flowers102"]:
         num_classes = 102
+    elif dataset_name in ("aircraft", "fgvc_aircraft", "fgvcaircraft"):
+        num_classes = 100
+    elif dataset_name == "eurosat":
+        num_classes = 10
+    elif dataset_name == "sun397":
+        num_classes = 397
     elif dataset_name == "pcam":
         num_classes = 2
     else:

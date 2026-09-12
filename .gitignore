@@ -1,6 +1,5 @@
 lora_dora_ortho_trials/
 outputs/
-scheduler/
 data/
 __pycache__/
 addition_trials/
@@ -11,3 +10,5 @@ all_blocks_substituition_leg/
 logs/
 outputs_legacy/
 logs2/
+scheduler/
+scheduler_legacy/
